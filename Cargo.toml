@@ -1,0 +1,21 @@
+[package]
+name = "obsidian-mcp-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = { version = "0.4.44", features = ["serde"] }
+clap = { version = "4.6.1", features = ["derive"] }
+rmcp = { version = "1.6.0", features = ["server", "macros", "schemars", "transport-io"] }
+schemars = "1.2.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tokio = { version = "1.52.2", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
