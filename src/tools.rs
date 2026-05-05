@@ -30,6 +30,7 @@ pub struct ListNotesParams {
     #[schemars(description = "Optional folder inside the vault")]
     pub folder: Option<String>,
     #[schemars(description = "Maximum number of notes to return")]
+    #[schemars(with = "Option<u32>")]
     pub limit: Option<usize>,
 }
 
@@ -50,6 +51,7 @@ pub struct SearchNotesParams {
     #[schemars(description = "Case-insensitive text query")]
     pub query: String,
     #[schemars(description = "Maximum number of matches to return")]
+    #[schemars(with = "Option<u32>")]
     pub limit: Option<usize>,
 }
 

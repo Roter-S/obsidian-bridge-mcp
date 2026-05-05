@@ -31,12 +31,14 @@ pub struct NoteInfo {
     pub path: String,
     pub title: String,
     pub modified: String,
+    #[schemars(with = "i64")]
     pub size: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct SearchMatch {
     pub path: String,
+    #[schemars(with = "i32")]
     pub line: usize,
     pub excerpt: String,
 }
