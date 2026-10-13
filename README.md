@@ -1,54 +1,72 @@
-# obsidian-mcp-rs
+# Obsidian Bridge MCP
 
-Rust MCP server for working directly with Obsidian vaults stored on disk.
+Rust MCP server for connecting Obsidian vaults to AI assistants (Pi, OpenCode, Claude, Cursor, Copilot, etc.).
 
 ## Features
 
+- Fast, native binary for macOS and Linux (ARM64 and x86_64)
+- Shared vault configuration across all AI agents (`obm setup`)
+- Diagnostic tool to inspect vault setup and upgrades (`obm doctor`)
 - Multiple configured vaults
 - Safe markdown-only note access
-- `list_vaults`
-- `list_notes`
-- `read_note`
-- `search_notes`
-- `create_note`
-- `append_note`
-- `update_note`
+- MCP tools:
+  - `list_vaults`
+  - `list_notes`
+  - `read_note`
+  - `search_notes`
+  - `create_note`
+  - `append_note`
+  - `update_note`
 
-## Install
+## Installation
 
-```bash
-cargo build --release
-```
-
-## Run
+### Homebrew (Recommended)
 
 ```bash
-obsidian-mcp-rs \
-  --vault "The Core=/Users/roberto/Library/Mobile Documents/iCloud~md~obsidian/Documents/The Core" \
-  --vault "BYTE=/Users/roberto/Library/Mobile Documents/iCloud~md~obsidian/Documents/BYTE"
+brew install roter-s/tap/obsidian-bridge-mcp
 ```
 
-Each `--vault` must use `NAME=/absolute/path` and the target directory must contain `.obsidian/`.
+### From Source
 
-## OpenCode Configuration
+```bash
+cargo install --path .
+```
+
+## Quick Start
+
+1. **Configure your vaults once:**
+
+   ```bash
+   obm setup
+   ```
+
+   Follow the prompts to add your vault paths (e.g. `The Core=/Users/.../Documents/Obsidian/The Core`). Vaults are saved to `~/.config/obsidian-bridge-mcp/config.json`.
+
+2. **Verify configuration:**
+
+   ```bash
+   obm doctor
+   ```
+
+## MCP Client Configuration (Pi, OpenCode, Claude, Cursor, etc.)
+
+Because `obm` reads your shared configuration, your AI agents only need to execute `obm` directly without repeating `--vault` flags:
 
 ```json
 {
   "mcp": {
     "obsidian": {
       "type": "local",
-      "command": [
-        "/Users/roberto/Web/obsidian-mcp-rs/target/release/obsidian-mcp-rs",
-        "--vault",
-        "The Core=/Users/roberto/Library/Mobile Documents/iCloud~md~obsidian/Documents/The Core",
-        "--vault",
-        "BYTE=/Users/roberto/Library/Mobile Documents/iCloud~md~obsidian/Documents/BYTE"
-      ],
+      "command": ["obm"],
       "enabled": true
     }
   }
 }
 ```
+
+Pi reads `~/.config/mcp/mcp.json` automatically through `pi-mcp-adapter`. After changing that file, run `/reload` (or restart Pi). The configured vault must be the vault root, not the project folder. For Nexus Core, use vault `The Core` and folder `Projects/Nexus Core`.
+
+> **Note**: You can still provide explicit vaults via `--vault NAME=/path` if you want to override the saved configuration for a specific agent.
 
 ## AGENTS.md Convention
 
