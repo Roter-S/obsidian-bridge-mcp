@@ -28,7 +28,7 @@ pub fn run(path: &Path, cli: &Cli) -> Result<()> {
     if vaults.is_empty() {
         writeln!(
             output,
-            "Enter one NAME=/absolute/path per line; blank line finishes:"
+            "Enter one vault per line (NAME=/absolute/path or /absolute/path); blank line finishes:"
         )?;
         output.flush()?;
         loop {

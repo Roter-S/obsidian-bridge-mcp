@@ -41,6 +41,12 @@ pub enum ObsidianError {
     NotAFile(PathBuf),
     #[error("path is not a directory: {0}")]
     NotADirectory(PathBuf),
+    #[error("i/o error while reading `{path}`: {source}")]
+    ReadNote {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }

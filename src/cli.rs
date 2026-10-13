@@ -7,8 +7,8 @@ use crate::error::ObsidianError;
 #[derive(Debug, Parser)]
 #[command(about = "MCP server for Obsidian vaults; run obm setup to configure vaults")]
 pub struct Cli {
-    /// Vault definition in the form NAME=/absolute/path/to/vault
-    #[arg(long = "vault", value_name = "NAME=PATH", global = true)]
+    /// Vault definition in the form [NAME=]/absolute/path/to/vault
+    #[arg(long = "vault", value_name = "[NAME=]PATH", global = true)]
     pub vaults: Vec<String>,
     /// Shared JSON configuration path (defaults to XDG_CONFIG_HOME or HOME/.config)
     #[arg(long, global = true)]
@@ -41,26 +41,37 @@ impl Cli {
 }
 
 fn parse_vault_spec(raw: &str) -> Result<VaultSpec, ObsidianError> {
-    let (name, path) = raw
-        .split_once('=')
-        .ok_or_else(|| ObsidianError::InvalidVaultSpec(raw.to_string()))?;
-
-    let name = name.trim();
-    let path = path.trim();
-
-    if name.is_empty() || path.is_empty() {
+    let raw = raw.trim();
+    if raw.is_empty() {
         return Err(ObsidianError::InvalidVaultSpec(raw.to_string()));
     }
 
-    let path = PathBuf::from(path);
+    let (name, path) = if let Some((name_part, path_part)) = raw.split_once('=') {
+        (
+            name_part.trim().to_string(),
+            PathBuf::from(path_part.trim()),
+        )
+    } else {
+        let path = PathBuf::from(raw);
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ObsidianError::InvalidVaultSpec(raw.to_string()))?
+            .to_string();
+        (name, path)
+    };
+
+    if name.is_empty() || path.as_os_str().is_empty() {
+        return Err(ObsidianError::InvalidVaultSpec(raw.to_string()));
+    }
+
     if !path.is_absolute() {
         return Err(ObsidianError::VaultPathNotAbsolute(path));
     }
 
-    Ok(VaultSpec {
-        name: name.to_string(),
-        path,
-    })
+    Ok(VaultSpec { name, path })
 }
 
 #[cfg(test)]
@@ -84,5 +95,24 @@ mod tests {
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].name, "The Core");
         assert_eq!(specs[1].name, "BYTE");
+    }
+
+    #[test]
+    fn infers_vault_name_from_folder_path_when_name_omitted() {
+        let cli = Cli::parse_from([
+            "obm",
+            "--vault",
+            "/tmp/The Core",
+            "--vault",
+            "Custom=/tmp/BYTE",
+        ]);
+
+        let specs = cli.parse_vault_specs().expect("vault specs should parse");
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "The Core");
+        assert_eq!(specs[0].path.to_str().unwrap(), "/tmp/The Core");
+        assert_eq!(specs[1].name, "Custom");
+        assert_eq!(specs[1].path.to_str().unwrap(), "/tmp/BYTE");
     }
 }

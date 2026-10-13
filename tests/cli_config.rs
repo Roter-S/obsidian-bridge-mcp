@@ -50,7 +50,7 @@ fn setup_multiple_doctor_and_rejected_replacement() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!(
-            "Enter one NAME=/absolute/path per line; blank line finishes:\nSaved configuration to {path}\n"
+            "Enter one vault per line (NAME=/absolute/path or /absolute/path); blank line finishes:\nSaved configuration to {path}\n"
         )
     );
     let original = std::fs::read(&config).unwrap();
@@ -191,4 +191,23 @@ fn default_location_and_confirmed_replacement() {
     let out = run(&root, OBM, &["doctor"], "");
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stdout).contains("OK: two\n"));
+}
+
+#[test]
+fn setup_bare_path_infers_name() {
+    let root = TempDir::new().unwrap();
+    let config = root.path().join("config.json");
+    let path = config.to_str().unwrap();
+    let vault_dir = root.path().join("The Core");
+    std::fs::create_dir_all(vault_dir.join(".obsidian")).unwrap();
+
+    // The user supplies only the directory path without "The Core="
+    let input = format!("{}\n\n", vault_dir.display());
+    let out = run(&root, OBM, &["--config", path, "setup"], &input);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty());
+
+    let out = run(&root, OBM, &["--config", path, "doctor"], "");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("OK: 1 vault(s)\nOK: The Core\n"));
 }

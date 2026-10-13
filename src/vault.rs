@@ -136,7 +136,9 @@ impl Vault {
 
     pub async fn read_note(&self, path: &str) -> Result<String, ObsidianError> {
         let path = self.resolve_note_path(path, true)?;
-        Ok(fs::read_to_string(path).await?)
+        fs::read_to_string(&path)
+            .await
+            .map_err(|source| ObsidianError::ReadNote { path, source })
     }
 
     pub async fn search_notes(
@@ -155,7 +157,12 @@ impl Vault {
         let mut matches = Vec::new();
 
         for entry in self.walk_markdown_files(&base)? {
-            let content = fs::read_to_string(entry.path()).await?;
+            let content = fs::read_to_string(entry.path()).await.map_err(|source| {
+                ObsidianError::ReadNote {
+                    path: entry.path().to_path_buf(),
+                    source,
+                }
+            })?;
             for (index, line) in content.lines().enumerate() {
                 if line.to_lowercase().contains(&needle) {
                     matches.push(SearchMatch {
