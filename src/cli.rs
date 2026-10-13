@@ -1,19 +1,31 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::error::ObsidianError;
 
 #[derive(Debug, Parser)]
-#[command(name = "obsidian-mcp-rs")]
-#[command(about = "MCP server for Obsidian vaults")]
+#[command(about = "MCP server for Obsidian vaults; run obm setup to configure vaults")]
 pub struct Cli {
     /// Vault definition in the form NAME=/absolute/path/to/vault
-    #[arg(long = "vault", value_name = "NAME=PATH", required = true)]
+    #[arg(long = "vault", value_name = "NAME=PATH", global = true)]
     pub vaults: Vec<String>,
+    /// Shared JSON configuration path (defaults to XDG_CONFIG_HOME or HOME/.config)
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: Option<Command>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Interactively configure vaults; asks before replacing existing configuration
+    Setup,
+    /// Validate stored configuration or explicit --vault overrides, and show upgrade guidance
+    Doctor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VaultSpec {
     pub name: String,
     pub path: PathBuf,
