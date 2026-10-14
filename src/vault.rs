@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use walkdir::WalkDir;
 
 use crate::cli::VaultSpec;
@@ -43,6 +42,7 @@ pub struct SearchMatch {
     pub path: String,
     #[schemars(with = "i32")]
     pub line: usize,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub excerpt: String,
 }
 
@@ -217,22 +217,34 @@ impl Vault {
         offset: Option<usize>,
         limit: Option<usize>,
     ) -> Result<(String, usize, usize), ObsidianError> {
-        let full_content = self.read_note(path).await?;
-        let lines: Vec<&str> = full_content.lines().collect();
-        let total_lines = lines.len();
-
-        let start = offset.unwrap_or(1).saturating_sub(1);
-        let count = limit.unwrap_or(total_lines);
-
-        if start >= total_lines {
-            return Ok((String::new(), total_lines, 0));
+        let full_path = self.resolve_note_path(path, true)?;
+        let file = fs::File::open(&full_path)
+            .await
+            .map_err(|source| ObsidianError::ReadNote {
+                path: full_path.clone(),
+                source,
+            })?;
+        let mut lines = BufReader::new(file).lines();
+        let start = offset.unwrap_or(1).max(1).saturating_sub(1);
+        let count = limit.unwrap_or(usize::MAX);
+        let mut total_lines = 0;
+        let mut selected = Vec::new();
+        while let Some(line) =
+            lines
+                .next_line()
+                .await
+                .map_err(|source| ObsidianError::ReadNote {
+                    path: full_path.clone(),
+                    source,
+                })?
+        {
+            if total_lines >= start && selected.len() < count {
+                selected.push(line);
+            }
+            total_lines += 1;
         }
-
-        let end = (start + count).min(total_lines);
-        let selected = lines[start..end].join("\n");
-        let read_count = end - start;
-
-        Ok((selected, total_lines, read_count))
+        let lines_read = selected.len();
+        Ok((selected.join("\n"), total_lines, lines_read))
     }
 
     pub async fn get_note_outline(
@@ -274,93 +286,94 @@ impl Vault {
         Ok((headings, total_lines))
     }
 
+    /// Ordered by path, then line. Only the requested page is retained.
     pub async fn search_notes(
         &self,
         folder: Option<&str>,
         query: &str,
         limit: usize,
         path_only: bool,
+        offset: usize,
     ) -> Result<Vec<SearchMatch>, ObsidianError> {
-        let base = self.resolve_folder_path(folder)?;
         let query = query.trim();
         if query.is_empty() {
-            return Err(ObsidianError::EmptyPath);
+            return Err(ObsidianError::EmptyQuery);
         }
-
+        let base = self.resolve_folder_path(folder)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let needle = query.to_lowercase();
-        let entries = self.walk_markdown_files(&base)?;
-
-        if path_only {
-            let mut matches = Vec::new();
-            for entry in entries {
-                let rel = self.relative_string(entry.path())?;
-                if contains_ignore_case(&rel, &needle) {
-                    matches.push(SearchMatch {
-                        path: rel.clone(),
-                        line: 1,
-                        excerpt: rel,
-                    });
-                    if matches.len() >= limit {
-                        break;
-                    }
-                }
-            }
-            return Ok(matches);
-        }
-
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
-        let mut join_set = tokio::task::JoinSet::new();
-
-        for entry in entries {
-            let sem = Arc::clone(&semaphore);
-            let path = entry.path().to_path_buf();
-            let needle = needle.clone();
-
-            join_set.spawn(async move {
-                let _permit = sem.acquire_owned().await.ok()?;
-                let content = fs::read_to_string(&path).await.ok()?;
-                let mut file_matches = Vec::new();
-
-                for (index, line) in content.lines().enumerate() {
-                    if contains_ignore_case(line, &needle) {
-                        file_matches.push((index + 1, line.trim().to_string()));
-                    }
-                }
-                Some((path, file_matches))
-            });
-        }
-
         let mut matches = Vec::new();
-        while let Some(res) = join_set.join_next().await {
-            if let Ok(Some((path, file_matches))) = res
-                && let Ok(rel) = self.relative_string(&path)
-            {
-                for (line, excerpt) in file_matches {
+        let mut skipped = 0;
+
+        for entry in self.walk_markdown_files(&base)? {
+            let rel = self.relative_string(entry.path())?;
+            if path_only {
+                if contains_ignore_case(&rel, &needle) {
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
                     matches.push(SearchMatch {
-                        path: rel.clone(),
-                        line,
-                        excerpt,
+                        path: rel,
+                        line: 1,
+                        excerpt: String::new(),
                     });
-                    if matches.len() >= limit {
-                        join_set.abort_all();
-                        return Ok(matches);
+                }
+            } else {
+                let path = entry.path();
+                let file =
+                    fs::File::open(path)
+                        .await
+                        .map_err(|source| ObsidianError::ReadNote {
+                            path: path.to_path_buf(),
+                            source,
+                        })?;
+                let mut lines = BufReader::new(file).lines();
+                let mut line_number = 0;
+                while let Some(line) =
+                    lines
+                        .next_line()
+                        .await
+                        .map_err(|source| ObsidianError::ReadNote {
+                            path: path.to_path_buf(),
+                            source,
+                        })?
+                {
+                    line_number += 1;
+                    if contains_ignore_case(&line, &needle) {
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        matches.push(SearchMatch {
+                            path: rel.clone(),
+                            line: line_number,
+                            excerpt: compact_excerpt(line.trim()),
+                        });
+                        if matches.len() >= limit {
+                            return Ok(matches);
+                        }
                     }
                 }
             }
+            if matches.len() >= limit {
+                break;
+            }
         }
-
-        matches.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-        matches.truncate(limit);
         Ok(matches)
     }
 
     pub async fn create_note(&self, path: &str, content: &str) -> Result<(), ObsidianError> {
         let path = self.resolve_note_path(path, false)?;
         if fs::try_exists(&path).await? {
-            return Err(ObsidianError::NoteAlreadyExists(path_to_string(&path)));
+            return Err(ObsidianError::NoteAlreadyExists(
+                self.relative_string(&path)?,
+            ));
         }
 
-        self.atomic_write(&path, content).await?;
+        self.atomic_write(&path, content, false).await?;
         Ok(())
     }
 
@@ -374,7 +387,7 @@ impl Vault {
 
     pub async fn update_note(&self, path: &str, content: &str) -> Result<(), ObsidianError> {
         let path = self.resolve_note_path(path, true)?;
-        self.atomic_write(&path, content).await?;
+        self.atomic_write(&path, content, true).await?;
         Ok(())
     }
 
@@ -411,7 +424,8 @@ impl Vault {
         }
 
         let patched_content = content.replacen(old_text, new_text, 1);
-        self.atomic_write(&full_path, &patched_content).await?;
+        self.atomic_write(&full_path, &patched_content, true)
+            .await?;
         Ok(())
     }
 
@@ -419,6 +433,7 @@ impl Vault {
         &self,
         target_path_or_title: &str,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<BacklinkMatch>, ObsidianError> {
         let target = target_path_or_title.trim();
         if target.is_empty() {
@@ -437,86 +452,82 @@ impl Vault {
             .trim_matches('/')
             .to_lowercase();
 
-        let entries = self.walk_markdown_files(&self.root)?;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
-        let mut join_set = tokio::task::JoinSet::new();
-
-        for entry in entries {
-            let sem = Arc::clone(&semaphore);
-            let path = entry.path().to_path_buf();
-            let stem = stem.clone();
-            let target_norm = target_norm.clone();
-
-            join_set.spawn(async move {
-                let _permit = sem.acquire_owned().await.ok()?;
-                let content = fs::read_to_string(&path).await.ok()?;
-                let mut file_matches = Vec::new();
-
-                for (index, line) in content.lines().enumerate() {
-                    if line.contains("[[") && line_contains_wikilink_to(line, &stem, &target_norm) {
-                        file_matches.push((index + 1, line.trim().to_string()));
-                    }
-                }
-                Some((path, file_matches))
-            });
+        if limit == 0 {
+            return Ok(Vec::new());
         }
-
         let mut backlinks = Vec::new();
-        while let Some(res) = join_set.join_next().await {
-            if let Ok(Some((path, file_matches))) = res
-                && let Ok(rel) = self.relative_string(&path)
+        let mut skipped = 0;
+        for entry in self.walk_markdown_files(&self.root)? {
+            let rel = self.relative_string(entry.path())?;
+            let rel_norm = rel.strip_suffix(".md").unwrap_or(&rel).to_lowercase();
+            let rel_stem = Path::new(&rel)
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .unwrap_or("")
+                .to_lowercase();
+            if rel_stem == stem || rel_norm == target_norm {
+                continue;
+            }
+            let path = entry.path();
+            let file = fs::File::open(path)
+                .await
+                .map_err(|source| ObsidianError::ReadNote {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            let mut lines = BufReader::new(file).lines();
+            let mut line_number = 0;
+            while let Some(line) =
+                lines
+                    .next_line()
+                    .await
+                    .map_err(|source| ObsidianError::ReadNote {
+                        path: path.to_path_buf(),
+                        source,
+                    })?
             {
-                let rel_stem = Path::new(&rel)
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("")
-                    .to_lowercase();
-                let rel_norm = rel.strip_suffix(".md").unwrap_or(&rel).to_lowercase();
-
-                if rel_stem == stem || rel_norm == target_norm {
-                    continue;
-                }
-
-                for (line, excerpt) in file_matches {
+                line_number += 1;
+                if line.contains("[[") && line_contains_wikilink_to(&line, &stem, &target_norm) {
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
                     backlinks.push(BacklinkMatch {
                         source_path: rel.clone(),
-                        line,
-                        excerpt,
+                        line: line_number,
+                        excerpt: compact_excerpt(line.trim()),
                     });
                     if backlinks.len() >= limit {
-                        join_set.abort_all();
-                        break;
+                        return Ok(backlinks);
                     }
                 }
             }
         }
-
-        backlinks.sort_by(|a, b| a.source_path.cmp(&b.source_path).then(a.line.cmp(&b.line)));
-        backlinks.truncate(limit);
         Ok(backlinks)
     }
 
     pub async fn list_tags(&self) -> Result<Vec<TagInfo>, ObsidianError> {
-        let entries = self.walk_markdown_files(&self.root)?;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
+        let mut entries = self.walk_markdown_files(&self.root)?.into_iter();
         let mut join_set = tokio::task::JoinSet::new();
-
-        for entry in entries {
-            let sem = Arc::clone(&semaphore);
-            let path = entry.path().to_path_buf();
-            join_set.spawn(async move {
-                let _permit = sem.acquire_owned().await.ok()?;
-                let content = fs::read_to_string(&path).await.ok()?;
-                Some(extract_tags_from_content(&content))
-            });
+        let read_tags = |path: PathBuf| async move {
+            let content = fs::read_to_string(&path)
+                .await
+                .map_err(|source| ObsidianError::ReadNote { path, source })?;
+            Ok::<_, ObsidianError>(extract_tags_from_content(&content))
+        };
+        // Bound tasks as well as open files; replenish only after a task completes.
+        for entry in entries.by_ref().take(32) {
+            join_set.spawn(read_tags(entry.into_path()));
         }
-
         let mut tag_counts: HashMap<String, usize> = HashMap::new();
-        while let Some(res) = join_set.join_next().await {
-            if let Ok(Some(tags)) = res {
-                for tag in tags {
-                    *tag_counts.entry(tag).or_insert(0) += 1;
-                }
+        while let Some(result) = join_set.join_next().await {
+            let tags =
+                result.map_err(|error| ObsidianError::Io(std::io::Error::other(error)))??;
+            for tag in tags {
+                *tag_counts.entry(tag).or_insert(0) += 1;
+            }
+            if let Some(entry) = entries.next() {
+                join_set.spawn(read_tags(entry.into_path()));
             }
         }
 
@@ -529,7 +540,12 @@ impl Vault {
         Ok(result)
     }
 
-    async fn atomic_write(&self, path: &Path, content: &str) -> Result<(), ObsidianError> {
+    async fn atomic_write(
+        &self,
+        path: &Path,
+        content: &str,
+        overwrite: bool,
+    ) -> Result<(), ObsidianError> {
         let parent = path.parent().ok_or_else(|| {
             ObsidianError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -567,9 +583,24 @@ impl Vault {
             return Err(ObsidianError::Io(e));
         }
 
-        if let Err(e) = fs::rename(&temp_path, path).await {
+        if overwrite {
+            if let Err(error) = fs::rename(&temp_path, path).await {
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(ObsidianError::Io(error));
+            }
+        } else {
+            // Publishing a hard link is atomic and fails if the destination exists.
+            // An existence check followed by rename could overwrite another creator.
+            let result = fs::hard_link(&temp_path, path).await;
             let _ = fs::remove_file(&temp_path).await;
-            return Err(ObsidianError::Io(e));
+            if let Err(error) = result {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Err(ObsidianError::NoteAlreadyExists(
+                        self.relative_string(path)?,
+                    ));
+                }
+                return Err(ObsidianError::Io(error));
+            }
         }
 
         Ok(())
@@ -581,7 +612,7 @@ impl Vault {
         };
 
         let relative = normalize_relative_path(folder, false)?;
-        let path = self.checked_join(&relative, true)?;
+        let path = self.checked_join(&relative)?;
 
         if !path.is_dir() {
             return Err(ObsidianError::FolderNotFound(folder.to_string()));
@@ -592,7 +623,7 @@ impl Vault {
 
     fn resolve_note_path(&self, path: &str, must_exist: bool) -> Result<PathBuf, ObsidianError> {
         let relative = normalize_relative_path(path, true)?;
-        let full_path = self.checked_join(&relative, must_exist)?;
+        let full_path = self.checked_join(&relative)?;
 
         if must_exist && !full_path.exists() {
             return Err(ObsidianError::NoteNotFound(path.to_string()));
@@ -605,7 +636,7 @@ impl Vault {
         Ok(full_path)
     }
 
-    fn checked_join(&self, relative: &Path, must_exist: bool) -> Result<PathBuf, ObsidianError> {
+    fn checked_join(&self, relative: &Path) -> Result<PathBuf, ObsidianError> {
         let mut current = self.root.clone();
         for component in relative.components() {
             let segment = component.as_os_str();
@@ -617,11 +648,9 @@ impl Vault {
                         return Err(ObsidianError::SymlinkNotAllowed(current));
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if must_exist {
-                        return Err(ObsidianError::Io(error));
-                    }
-                }
+                // Existence is validated by the caller, which knows whether this is
+                // a folder or note and can return a useful resource-not-found error.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(ObsidianError::Io(error)),
             }
         }
@@ -647,6 +676,7 @@ impl Vault {
             }
         }
 
+        files.sort_by(|a, b| a.path().cmp(b.path()));
         Ok(files)
     }
 
@@ -656,6 +686,16 @@ impl Vault {
             .map_err(|_| ObsidianError::PathTraversal(path_to_string(path)))?;
         Ok(path_to_string(relative))
     }
+}
+
+/// Bound returned snippets without splitting UTF-8; full text is available via read_note.
+fn compact_excerpt(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut result: String = chars.by_ref().take(240).collect();
+    if chars.next().is_some() {
+        result.push('…');
+    }
+    result
 }
 
 fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
@@ -1002,6 +1042,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_stops_early_and_reports_read_failures_when_reached() {
+        let (temp, vault) = temp_vault("Test");
+        vault.create_note("a.md", "needle").await.unwrap();
+        std::fs::write(temp.path().join("z.md"), [0xff, 0xfe]).unwrap();
+        let first = vault
+            .search_notes(None, "needle", 1, false, 0)
+            .await
+            .unwrap();
+        assert_eq!(first[0].path, "a.md");
+        let error = vault
+            .search_notes(None, "needle", 2, false, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::ObsidianError::ReadNote { .. }
+        ));
+        // Path-only discovery must not read or decode note bodies.
+        let paths = vault.search_notes(None, ".md", 10, true, 0).await.unwrap();
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tag_scan_replenishes_bounded_workers() {
+        let (_temp, vault) = temp_vault("Test");
+        for i in 0..70 {
+            vault
+                .create_note(&format!("{i:03}.md"), "#shared")
+                .await
+                .unwrap();
+        }
+        let tags = vault.list_tags().await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].tag, "shared");
+        assert_eq!(tags[0].count, 70);
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_never_overwrites_the_winner() {
+        let (_temp, vault) = temp_vault("Test");
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let vault = vault.clone();
+            tasks.spawn(async move {
+                let content = format!("writer {i}");
+                let result = vault.create_note("same.md", &content).await;
+                (content, result)
+            });
+        }
+        let mut winners = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            let (content, result) = result.expect("task");
+            match result {
+                Ok(()) => winners.push(content),
+                Err(crate::error::ObsidianError::NoteAlreadyExists(_)) => {}
+                Err(error) => panic!("unexpected create error: {error}"),
+            }
+        }
+        assert_eq!(winners.len(), 1);
+        assert_eq!(vault.read_note("same.md").await.unwrap(), winners[0]);
+    }
+
+    #[tokio::test]
     async fn search_notes_returns_matches() {
         let (_temp, vault) = temp_vault("The Core");
 
@@ -1011,7 +1114,7 @@ mod tests {
             .expect("create note");
 
         let matches = vault
-            .search_notes(Some("Projects"), "pending", 10, false)
+            .search_notes(Some("Projects"), "pending", 10, false, 0)
             .await
             .expect("search notes");
 
@@ -1019,7 +1122,7 @@ mod tests {
         assert_eq!(matches[0].line, 2);
 
         let path_matches = vault
-            .search_notes(None, "demo", 10, true)
+            .search_notes(None, "demo", 10, true, 0)
             .await
             .expect("path search");
         assert_eq!(path_matches.len(), 1);
@@ -1047,7 +1150,7 @@ mod tests {
             .expect("create b");
 
         let backlinks = vault
-            .get_backlinks("Target.md", 10)
+            .get_backlinks("Target.md", 10, 0)
             .await
             .expect("backlinks");
         assert_eq!(backlinks.len(), 1);

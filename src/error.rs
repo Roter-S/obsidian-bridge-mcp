@@ -21,10 +21,14 @@ pub enum ObsidianError {
     UnknownVault(String),
     #[error("no vaults are configured")]
     NoVaultsConfigured,
-    #[error("multiple vaults are configured ({0}); please specify vault name")]
+    #[error(
+        "multiple vaults are configured ({0}); pass vault with one of these exact names, or call list_vaults"
+    )]
     AmbiguousVault(String),
     #[error("path cannot be empty")]
     EmptyPath,
+    #[error("search query cannot be empty; use list_notes with folder to browse notes")]
+    EmptyQuery,
     #[error("absolute paths are not allowed: {0}")]
     AbsolutePath(String),
     #[error("path traversal is not allowed: {0}")]

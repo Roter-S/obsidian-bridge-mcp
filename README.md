@@ -12,10 +12,10 @@ Rust MCP server for connecting Obsidian vaults to AI assistants (Pi, OpenCode, C
 - MCP tools:
   - `list_vaults`
   - `list_notes` (compact paths by default, optional `details`)
-  - `read_note` (supports optional line `offset` and `limit`)
+  - `read_note` (200 lines by default; paginated with `offset` and `limit`)
   - `get_note_outline` (headings/TOC with line numbers)
   - `patch_note` (token-efficient find & replace)
-  - `search_notes` (fast parallel search, optional `path_only`)
+  - `search_notes` (ordered streaming search with early stop; optional `path_only`)
   - `get_backlinks` (find wikilinks `[[...]]` pointing to a note)
   - `list_tags` (all `#tags` and frontmatter tags)
   - `create_note` (atomic write)
@@ -54,7 +54,9 @@ cargo install --path .
 
 ## MCP Client Configuration (Pi, OpenCode, Claude, Cursor, etc.)
 
-Because `obm` reads your shared configuration, your AI agents only need to execute `obm` directly without repeating `--vault` flags:
+Because `obm` reads your shared configuration, each agent only needs to register `obm` as a **stdio MCP server**, without repeating `--vault` flags. No Rust runtime, Node, Python, skill, or agent-specific wrapper is required to run the installed binary.
+
+Each client has its own configuration format. For example, **OpenCode** uses:
 
 ```json
 {
@@ -68,13 +70,15 @@ Because `obm` reads your shared configuration, your AI agents only need to execu
 }
 ```
 
-Pi reads `~/.config/mcp/mcp.json` automatically through `pi-mcp-adapter`. After changing that file, run `/reload` (or restart Pi). The configured vault must be the vault root, not the project folder. For Nexus Core, use vault `The Core` and folder `Projects/Nexus Core`.
+For Pi, Codex, or another client, use that client's MCP configuration format with executable `obm` (or its absolute installed path), no arguments, and stdio transport. Restart/reconnect the MCP server after upgrading so the client refreshes instructions and tool schemas. The configured filesystem path must be the vault root, not a project folder.
 
 > **Note**: You can still provide explicit vaults via `--vault NAME=/path` if you want to override the saved configuration for a specific agent.
 
 ## AGENTS.md Convention
 
-The MCP server does not read `AGENTS.md`. OpenCode should read project instructions and pass the right `vault`, `folder`, and `path` values to the MCP tools.
+The MCP server is self-describing: its initialization instructions include configured vault names, and tool schemas explain browsing, searching, paging, and editing. **A skill is not required** for basic operation in any MCP client.
+
+An optional `AGENTS.md` records project-specific routing that the server cannot infer safely. The MCP server does not read it; the agent reads it and passes the right `vault`, `folder`, and `path`. This avoids repeated cross-vault discovery.
 
 Example:
 
@@ -93,7 +97,19 @@ For progress updates, append to `Projects/nexus-core-backend/00-Overview.md`.
 
 ## Tool Inputs
 
-> **Note**: `vault` is optional across all tools whenever a single vault is configured.
+> **Note**: `vault` is optional across all tools whenever a single vault is configured. With multiple vaults, pass an exact configured name; the server never guesses.
+
+### Efficient agent workflow
+
+1. Use the vault names supplied at MCP initialization; call `list_vaults` if the client does not expose server instructions.
+2. Browse a folder with `list_notes`. Do not use `search_notes` with `query: ""`.
+3. Search with a **non-empty literal** query; use `path_only: true` when looking for filenames/paths without reading note bodies.
+4. Read only relevant lines. `read_note` defaults to 200 lines and clamps `limit` to 1–500. Use outlines when structure is useful, not automatically before every small read.
+5. Prefer `patch_note` for a small unique edit, `append_note` for additions, and `update_note` only for an intentional full replacement.
+
+`list_notes`, `search_notes`, `get_backlinks`, and `list_tags` return `count` (this page), `has_more`, and `next_offset` when more results exist. Pass that offset with the same filters to continue. Their offsets are **zero-based result counts**. `read_note` uses **1-based line offsets** and also returns `has_more` / `next_offset`. Do not fetch more pages unless the task needs them.
+
+See the [usage guide](docs/usage.md) for tool examples, pagination, targeted edits, and troubleshooting.
 
 `list_vaults`
 

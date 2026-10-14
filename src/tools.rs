@@ -29,7 +29,7 @@ impl ObsidianService {
 pub struct ListNotesParams {
     #[schemars(description = "Configured vault name. Optional if only one vault is configured.")]
     pub vault: Option<String>,
-    #[schemars(description = "Optional folder inside the vault to list notes from")]
+    #[schemars(description = "Vault-relative folder, searched recursively. Omit for vault root.")]
     pub folder: Option<String>,
     #[schemars(description = "Maximum number of notes to return (default 100, max 500)")]
     #[schemars(with = "Option<u32>")]
@@ -38,6 +38,9 @@ pub struct ListNotesParams {
         description = "Include detailed metadata (modified date, size). Defaults to false for minimal token usage."
     )]
     pub details: Option<bool>,
+    #[schemars(description = "Zero-based result offset; use next_offset from previous response")]
+    #[schemars(with = "Option<u32>")]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -49,7 +52,9 @@ pub struct ReadNoteParams {
     #[schemars(description = "Optional 1-indexed line number to start reading from")]
     #[schemars(with = "Option<u32>")]
     pub offset: Option<usize>,
-    #[schemars(description = "Optional maximum number of lines to read")]
+    #[schemars(
+        description = "Maximum lines to read (default 200, max 500). Follow next_offset for more."
+    )]
     #[schemars(with = "Option<u32>")]
     pub limit: Option<usize>,
 }
@@ -68,7 +73,10 @@ pub struct SearchNotesParams {
     pub vault: Option<String>,
     #[schemars(description = "Optional folder inside the vault to constrain search")]
     pub folder: Option<String>,
-    #[schemars(description = "Case-insensitive text query")]
+    #[schemars(
+        description = "Non-empty case-insensitive literal text. To browse without a query, use list_notes."
+    )]
+    #[schemars(length(min = 1))]
     pub query: String,
     #[schemars(description = "Maximum number of matches to return (default 20, max 200)")]
     #[schemars(with = "Option<u32>")]
@@ -77,6 +85,9 @@ pub struct SearchNotesParams {
         description = "If true, only searches note titles/paths (much faster, zero body I/O)"
     )]
     pub path_only: Option<bool>,
+    #[schemars(description = "Zero-based match offset; use next_offset from previous response")]
+    #[schemars(with = "Option<u32>")]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -110,12 +121,21 @@ pub struct GetBacklinksParams {
     #[schemars(description = "Maximum number of backlinks to return (default 50, max 200)")]
     #[schemars(with = "Option<u32>")]
     pub limit: Option<usize>,
+    #[schemars(description = "Zero-based match offset; follow next_offset")]
+    #[schemars(with = "Option<u32>")]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListTagsParams {
     #[schemars(description = "Configured vault name. Optional if only one vault is configured.")]
     pub vault: Option<String>,
+    #[schemars(description = "Maximum tags to return (default 100, max 500)")]
+    #[schemars(with = "Option<u32>")]
+    pub limit: Option<usize>,
+    #[schemars(description = "Zero-based result offset; follow next_offset")]
+    #[schemars(with = "Option<u32>")]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -131,6 +151,9 @@ pub struct ListNotesResult {
     #[schemars(description = "Detailed note info when details=true")]
     pub details: Option<Vec<NoteInfo>>,
     pub count: usize,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -141,6 +164,9 @@ pub struct ReadNoteResult {
     pub total_lines: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines_read: Option<usize>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -154,12 +180,17 @@ pub struct GetNoteOutlineResult {
 pub struct SearchNotesResult {
     pub matches: Vec<SearchMatch>,
     pub count: usize,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct WriteNoteResult {
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub updated: Option<bool>,
 }
 
@@ -174,17 +205,30 @@ pub struct GetBacklinksResult {
     pub target: String,
     pub backlinks: Vec<BacklinkMatch>,
     pub count: usize,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ListTagsResult {
     pub tags: Vec<TagInfo>,
     pub count: usize,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 #[tool_router]
 impl ObsidianService {
-    #[tool(description = "List configured Obsidian vaults")]
+    #[tool(
+        description = "List configured Obsidian vaults",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
     async fn list_vaults(&self) -> Json<ListVaultsResult> {
         Json(ListVaultsResult {
             vaults: self.registry.list(),
@@ -192,7 +236,12 @@ impl ObsidianService {
     }
 
     #[tool(
-        description = "List markdown notes from a vault folder (compact paths by default, details=true for metadata)"
+        description = "Browse markdown paths recursively, no query needed. Use for folder discovery, not search_notes with an empty query. Compact paths by default; follow next_offset while has_more. Stable path order (details=true: newest first).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn list_notes(
         &self,
@@ -201,34 +250,44 @@ impl ObsidianService {
         let vault = self.registry.get_or_default(params.vault.as_deref())?;
         let limit = clamp_limit(params.limit, 100, 500);
 
-        if params.details.unwrap_or(false) {
-            let note_infos = vault
-                .list_notes(params.folder.as_deref(), limit)
-                .await
-                .map_err(ErrorData::from)?;
-            let paths = note_infos.iter().map(|n| n.path.clone()).collect();
-            let count = note_infos.len();
-            Ok(Json(ListNotesResult {
-                notes: paths,
-                details: Some(note_infos),
-                count,
-            }))
+        let offset = params.offset.unwrap_or(0);
+        let fetch = offset.saturating_add(limit).saturating_add(1);
+        let (notes, details, has_more) = if params.details.unwrap_or(false) {
+            let infos = vault.list_notes(params.folder.as_deref(), fetch).await?;
+            let mut page: Vec<_> = infos.into_iter().skip(offset).collect();
+            let has_more = page.len() > limit;
+            page.truncate(limit);
+            (
+                page.iter().map(|n| n.path.clone()).collect(),
+                Some(page),
+                has_more,
+            )
         } else {
             let paths = vault
-                .list_note_paths(params.folder.as_deref(), limit)
-                .await
-                .map_err(ErrorData::from)?;
-            let count = paths.len();
-            Ok(Json(ListNotesResult {
-                notes: paths,
-                details: None,
-                count,
-            }))
-        }
+                .list_note_paths(params.folder.as_deref(), fetch)
+                .await?;
+            let mut page: Vec<_> = paths.into_iter().skip(offset).collect();
+            let has_more = page.len() > limit;
+            page.truncate(limit);
+            (page, None, has_more)
+        };
+        let count = notes.len();
+        Ok(Json(ListNotesResult {
+            notes,
+            details,
+            count,
+            has_more,
+            next_offset: has_more.then(|| offset.saturating_add(count)),
+        }))
     }
 
     #[tool(
-        description = "Read a markdown note from a vault (supports optional offset line and line limit)"
+        description = "Read a note, default 200 lines, max 500 per call. Offset is 1-based. Follow next_offset while has_more. Use get_note_outline first only when structure is needed.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn read_note(
         &self,
@@ -236,35 +295,30 @@ impl ObsidianService {
     ) -> Result<Json<ReadNoteResult>, ErrorData> {
         let vault = self.registry.get_or_default(params.vault.as_deref())?;
 
-        if params.offset.is_some() || params.limit.is_some() {
-            let (content, total_lines, lines_read) = vault
-                .read_note_range(&params.path, params.offset, params.limit)
-                .await
-                .map_err(ErrorData::from)?;
-
-            Ok(Json(ReadNoteResult {
-                path: params.path,
-                content,
-                total_lines: Some(total_lines),
-                lines_read: Some(lines_read),
-            }))
-        } else {
-            let content = vault
-                .read_note(&params.path)
-                .await
-                .map_err(ErrorData::from)?;
-
-            Ok(Json(ReadNoteResult {
-                path: params.path,
-                content,
-                total_lines: None,
-                lines_read: None,
-            }))
-        }
+        let offset = params.offset.unwrap_or(1).max(1);
+        let limit = clamp_limit(params.limit, 200, 500);
+        let (content, total_lines, lines_read) = vault
+            .read_note_range(&params.path, Some(offset), Some(limit))
+            .await?;
+        let next = offset.saturating_add(lines_read);
+        let has_more = next <= total_lines;
+        Ok(Json(ReadNoteResult {
+            path: params.path,
+            content,
+            total_lines: Some(total_lines),
+            lines_read: Some(lines_read),
+            has_more,
+            next_offset: has_more.then_some(next),
+        }))
     }
 
     #[tool(
-        description = "Get table of contents / headings of a note with line numbers without reading the full body"
+        description = "Return headings with line numbers instead of the note body. Scans the file internally. Use when structure is needed before choosing lines to read.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn get_note_outline(
         &self,
@@ -284,29 +338,49 @@ impl ObsidianService {
     }
 
     #[tool(
-        description = "Search case-insensitive text across markdown notes (content search) or note paths (path_only=true)"
+        description = "Find non-empty literal text in note content or paths (path_only=true, no body reads). To list a folder use list_notes. Results ordered by path/line; snippets capped at 240 characters. Follow next_offset while has_more.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn search_notes(
         &self,
         Parameters(params): Parameters<SearchNotesParams>,
     ) -> Result<Json<SearchNotesResult>, ErrorData> {
         let vault = self.registry.get_or_default(params.vault.as_deref())?;
-        let matches = vault
+        let limit = clamp_limit(params.limit, 20, 200);
+        let offset = params.offset.unwrap_or(0);
+        let mut matches = vault
             .search_notes(
                 params.folder.as_deref(),
                 &params.query,
-                clamp_limit(params.limit, 20, 200),
+                limit + 1,
                 params.path_only.unwrap_or(false),
+                offset,
             )
             .await
             .map_err(ErrorData::from)?;
 
+        let has_more = matches.len() > limit;
+        matches.truncate(limit);
         let count = matches.len();
-        Ok(Json(SearchNotesResult { matches, count }))
+        Ok(Json(SearchNotesResult {
+            matches,
+            count,
+            has_more,
+            next_offset: has_more.then(|| offset.saturating_add(count)),
+        }))
     }
 
     #[tool(
-        description = "Create a new markdown note (fails if note already exists; writes atomically)"
+        description = "Create a new markdown note (fails if note already exists; writes atomically)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn create_note(
         &self,
@@ -325,7 +399,14 @@ impl ObsidianService {
         }))
     }
 
-    #[tool(description = "Append markdown content to an existing note")]
+    #[tool(
+        description = "Append markdown content to an existing note",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn append_note(
         &self,
         Parameters(params): Parameters<WriteNoteParams>,
@@ -343,7 +424,14 @@ impl ObsidianService {
         }))
     }
 
-    #[tool(description = "Replace all markdown content in an existing note (writes atomically)")]
+    #[tool(
+        description = "Replace all markdown content in an existing note (writes atomically)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn update_note(
         &self,
         Parameters(params): Parameters<WriteNoteParams>,
@@ -362,7 +450,12 @@ impl ObsidianService {
     }
 
     #[tool(
-        description = "Find and replace an exact text snippet in an existing note (token-efficient; requires unique match)"
+        description = "Find and replace an exact text snippet in an existing note (token-efficient; requires unique match)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn patch_note(
         &self,
@@ -381,28 +474,44 @@ impl ObsidianService {
     }
 
     #[tool(
-        description = "Find all notes in the vault that contain wikilinks [[...]] pointing to a given note"
+        description = "Find wikilinks [[...]] pointing to a note. Ordered by path/line; snippets capped at 240 characters. Follow next_offset while has_more. Basename links may be ambiguous when titles repeat.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn get_backlinks(
         &self,
         Parameters(params): Parameters<GetBacklinksParams>,
     ) -> Result<Json<GetBacklinksResult>, ErrorData> {
         let vault = self.registry.get_or_default(params.vault.as_deref())?;
-        let backlinks = vault
-            .get_backlinks(&params.path, clamp_limit(params.limit, 50, 200))
+        let limit = clamp_limit(params.limit, 50, 200);
+        let offset = params.offset.unwrap_or(0);
+        let mut backlinks = vault
+            .get_backlinks(&params.path, limit + 1, offset)
             .await
             .map_err(ErrorData::from)?;
 
+        let has_more = backlinks.len() > limit;
+        backlinks.truncate(limit);
         let count = backlinks.len();
         Ok(Json(GetBacklinksResult {
             target: params.path,
             backlinks,
             count,
+            has_more,
+            next_offset: has_more.then(|| offset.saturating_add(count)),
         }))
     }
 
     #[tool(
-        description = "List all tags (#tag and YAML frontmatter) across the vault sorted by usage count"
+        description = "List tags (#tag and YAML frontmatter), sorted by usage then name. Scans the vault; reuse results. Default 100, max 500; follow next_offset while has_more.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn list_tags(
         &self,
@@ -410,18 +519,35 @@ impl ObsidianService {
     ) -> Result<Json<ListTagsResult>, ErrorData> {
         let vault = self.registry.get_or_default(params.vault.as_deref())?;
         let tags = vault.list_tags().await.map_err(ErrorData::from)?;
+        let offset = params.offset.unwrap_or(0);
+        let limit = clamp_limit(params.limit, 100, 500);
+        let has_more = tags.len().saturating_sub(offset) > limit;
+        let tags: Vec<_> = tags.into_iter().skip(offset).take(limit).collect();
         let count = tags.len();
 
-        Ok(Json(ListTagsResult { tags, count }))
+        Ok(Json(ListTagsResult {
+            tags,
+            count,
+            has_more,
+            next_offset: has_more.then(|| offset.saturating_add(count)),
+        }))
     }
 }
 
-#[tool_handler(
-    name = "obsidian",
-    version = "0.2.0",
-    instructions = "Use this server to read, search, and update Obsidian vault notes. When only one vault is configured, 'vault' is optional. Use 'patch_note' for token-efficient targeted edits, 'get_note_outline' to inspect structure before reading large files, and 'read_note' with offset/limit for large documents."
-)]
-impl ServerHandler for ObsidianService {}
+#[tool_handler]
+impl ServerHandler for ObsidianService {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        let names: Vec<_> = self.registry.list().into_iter().map(|v| v.name).collect();
+        let vaults = serde_json::to_string(&names).expect("vault names serialize");
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder().enable_tools().build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new("obsidian", env!("CARGO_PKG_VERSION")))
+        .with_instructions(format!(
+            "Obsidian notes. Configured vaults: {vaults}. Pass exact vault name when multiple; optional with one. Never guess a vault for writes. Browse folders with list_notes (no query); search_notes requires non-empty literal text, path_only avoids body reads. Paths/folders are vault-relative; notes end in .md. Read only needed pages (read_note defaults to 200 lines); follow next_offset while has_more. List/search offsets are zero-based; read offsets are 1-based. Use patch_note for small unique edits, not full rewrites. No skill required."
+        ))
+    }
+}
 
 fn clamp_limit(limit: Option<usize>, default: usize, max: usize) -> usize {
     limit.unwrap_or(default).clamp(1, max)
@@ -465,6 +591,7 @@ mod tests {
                 folder: None,
                 limit: None,
                 details: None,
+                offset: None,
             }))
             .await
             .expect("list");

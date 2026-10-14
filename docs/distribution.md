@@ -1,95 +1,116 @@
-# Prepared binary distribution
+# Install and update prebuilt binaries
 
-This is local scaffolding, not an announcement of available releases or a tap.
-The Homebrew package is `obsidian-bridge-mcp`, with formula class
-`ObsidianBridgeMcp` and filename `obsidian-bridge-mcp.rb`. Its executable is
-`obm`; the legacy `obsidian-mcp-rs` executable remains independent. Release packaging requires the `obm` entrypoint to exist in the
-selected version tag. No README changes are part of this distribution work.
+Obsidian Bridge MCP provides native `obm` binaries for macOS and GNU/Linux on
+ARM64 and x86_64. Running a prebuilt binary does not require Rust, Node, or Python.
 
-## Prepare archives
-
-A maintainer may manually dispatch **Prepare versioned archives** with an
-**existing** tag such as `v0.1.0`, only when that tag matches the crate version.
-Checkout uses the explicit tag reference, not main. Tags must use
-`vMAJOR.MINOR.PATCH` (no prerelease suffix). Main commits do not trigger releases.
-The workflow has read-only repository permissions and uploads workflow artifacts;
-it does not create or publish a GitHub release.
-
-| Native runner | Archive target |
-| --- | --- |
-| macos-14 | aarch64-apple-darwin |
-| macos-15-intel | x86_64-apple-darwin |
-| ubuntu-24.04-arm | aarch64-unknown-linux-gnu |
-| ubuntu-24.04 | x86_64-unknown-linux-gnu |
-
-Each job tests and builds on the matching native runner, then packages `obm` at
-the archive root with executable permissions and a SHA256 sidecar. Runner
-availability depends on GitHub and repository eligibility. Workflow YAML alone
-**does not verify platform support**. Linux archives target GNU/Linux, not musl;
-minimum OS/libc compatibility and executable runtime behavior need actual
-platform validation. Local fixture packaging was exercised on macOS ARM64;
-that does not validate the Rust binary or any other platform.
-
-For local packaging (Rust toolchain required):
-
-```sh
-cargo run --bin dist -- package v0.1.1 aarch64-apple-darwin target/release/obm dist
-```
-
-The script rejects version mismatches, non-native targets, non-executable input,
-and existing artifact destinations. Version is read from `Cargo.toml`; an
-optional fifth argument selects a manifest for isolated testing. Successful
-packaging is silent. It does not infer executable architecture from the file:
-the caller must supply the native build, as the workflow does.
-
-## Render a formula only from real artifacts
-
-Collect all four archives and their `.tar.gz.sha256` sidecars in one directory.
-The sidecar format is `SHA256`, two spaces, archive basename, then newline.
-The renderer checks each checksum against the actual archive bytes before
-writing anything; missing or mismatched inputs leave the destination unchanged.
-
-```sh
-cargo run --bin dist -- formula 0.1.1 dist Formula/obsidian-bridge-mcp.rb
-```
-
-The generated formula selects a binary archive for macOS/Linux ARM64/x86_64
-from `Roter-S/obsidian-bridge-mcp` GitHub releases. It installs only `obm`:
-no setup command, vault discovery, or external configuration writes occur during
-Homebrew installation. These URLs describe the intended publication layout,
-not assets currently available. Checksums are derived from real files, never
-placeholders. The renderer checks integrity, not archive authenticity or runtime
-compatibility; use only reviewed artifacts from the intended workflow run.
-
-## Publication is a separate maintainer operation
-
-Before publishing, inspect all four job results, verify checksums and runtime
-behavior on supported systems, and explicitly authorize a versioned GitHub
-release. Upload the exact archives and sidecars to that release. Only after
-those URLs resolve should a maintainer publish the generated
-`obsidian-bridge-mcp.rb` in the proposed `roter-s/tap` Homebrew tap, after separate
-explicit authorization. Neither this workflow nor these scripts create
-a remote tap or publish a release. Signing/notarization is not implemented.
-
-The intended tap-qualified package is **PROPOSED**, not currently available:
-`roter-s/tap/obsidian-bridge-mcp`. Only after the tap and release are published,
-the proposed user commands are:
+## Install with Homebrew
 
 ```sh
 brew install roter-s/tap/obsidian-bridge-mcp
-brew upgrade roter-s/tap/obsidian-bridge-mcp
 ```
 
-The package name is `obsidian-bridge-mcp`; users still invoke `obm` after
-installation. Binary installation needs no Rust toolchain. Upgrades replace the executable,
-not configuration stored outside Homebrew. Users run setup separately after
-installation when desired. No source-build fallback is promised here.
+The package is named `obsidian-bridge-mcp`; the command you run is `obm`.
+Homebrew installs the executable but does not configure vaults or change your
+MCP client settings.
 
-## Local checks
+After the first installation:
 
 ```sh
-cargo test --test distribution
+obm setup
+obm doctor
 ```
 
-Tests use isolated temporary files and a small executable fixture; they do not
-install software, write user configuration, or publish anything.
+Register `obm` as a stdio MCP server in your client. See the
+[README](../README.md#mcp-client-configuration-pi-opencode-claude-cursor-etc)
+and [configuration guide](configuration.md).
+
+## Update with Homebrew
+
+```sh
+brew update
+brew upgrade roter-s/tap/obsidian-bridge-mcp
+brew list --versions obsidian-bridge-mcp
+obm doctor
+```
+
+Upgrading replaces the executable, not your shared vault configuration. Do not
+run setup again unless you want to change that configuration.
+
+Reconnect or restart the MCP server in each client after an upgrade. Already
+running processes continue using the previous binary and clients may cache tool
+schemas and connection instructions.
+
+If a client still uses an old version, check which executable it launches:
+
+```sh
+command -v obm
+brew --prefix obsidian-bridge-mcp
+```
+
+A client configured with a repository's `target/release/obm` will not be updated
+by Homebrew. Point it at the Homebrew-installed executable if you want Homebrew
+to manage its upgrades.
+
+## Download an archive manually
+
+Download the appropriate archive and matching `.sha256` file from the
+[GitHub releases page](https://github.com/Roter-S/obsidian-bridge-mcp/releases).
+Use the files attached to the same release; do not substitute workflow artifacts
+or archives from another version.
+
+| System | Archive target |
+| --- | --- |
+| macOS, Apple Silicon | `aarch64-apple-darwin` |
+| macOS, Intel | `x86_64-apple-darwin` |
+| GNU/Linux, ARM64 | `aarch64-unknown-linux-gnu` |
+| GNU/Linux, x86_64 | `x86_64-unknown-linux-gnu` |
+
+Archive names follow `obm-VERSION-TARGET.tar.gz` and contain an executable named
+`obm`. Linux downloads target GNU/Linux, not musl-based distributions such as
+Alpine. Signing and notarization are not provided.
+
+For example, in a directory containing both downloaded files:
+
+```sh
+# macOS: verify the checksum before extracting.
+shasum -a 256 -c obm-VERSION-aarch64-apple-darwin.tar.gz.sha256
+
+# GNU/Linux: use sha256sum instead.
+sha256sum -c obm-VERSION-aarch64-unknown-linux-gnu.tar.gz.sha256
+```
+
+Replace `VERSION` and the target with the files you downloaded; run only the
+command for your platform. If checksum verification fails, do not install the
+archive. Download both files again from the release page.
+
+Extract the verified archive and place `obm` in a directory on your `PATH`, or
+configure your MCP client with its absolute executable path. Manual installations
+must be updated manually; Homebrew does not manage them.
+
+## Build from source
+
+With a Rust toolchain installed, run from the repository:
+
+```sh
+cargo install --path . --bin obm --locked
+```
+
+Then run `obm setup` if you have not configured vaults yet, and `obm doctor` to
+validate them. Reconnect your MCP clients after replacing the executable.
+
+## Check behavior changes when upgrading
+
+Read the release notes before upgrading clients that process tool output directly.
+Starting with v0.3.0:
+
+- `read_note` returns at most 200 lines by default and clamps explicit limits to
+  500 lines. Follow `next_offset` while `has_more` is true to read more.
+- `list_tags` returns the first 100 tags by default, with a maximum of 500 per page.
+- Lists, searches, backlinks, and tags provide pagination metadata. Their offsets
+  are zero-based; read offsets are 1-based line numbers.
+- Path-only search matches omit the redundant `excerpt` field. Unused write-result
+  fields are omitted rather than returned as `null`.
+- Read failures in searches, backlinks, and tag scans are reported instead of
+  silently returning incomplete successful results.
+
+See the [usage guide](usage.md) for examples and troubleshooting.
