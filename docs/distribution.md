@@ -30,10 +30,10 @@ minimum OS/libc compatibility and executable runtime behavior need actual
 platform validation. Local fixture packaging was exercised on macOS ARM64;
 that does not validate the Rust binary or any other platform.
 
-For local packaging (Python 3.11+ and Bash required):
+For local packaging (Rust toolchain required):
 
 ```sh
-bash scripts/package-release.sh v0.1.0 aarch64-apple-darwin target/release/obm dist
+cargo run --bin dist -- package v0.1.1 aarch64-apple-darwin target/release/obm dist
 ```
 
 The script rejects version mismatches, non-native targets, non-executable input,
@@ -50,7 +50,7 @@ The renderer checks each checksum against the actual archive bytes before
 writing anything; missing or mismatched inputs leave the destination unchanged.
 
 ```sh
-python3 scripts/render-formula.py 0.1.0 dist obsidian-bridge-mcp.rb
+cargo run --bin dist -- formula 0.1.1 dist Formula/obsidian-bridge-mcp.rb
 ```
 
 The generated formula selects a binary archive for macOS/Linux ARM64/x86_64
@@ -88,8 +88,7 @@ installation when desired. No source-build fallback is promised here.
 ## Local checks
 
 ```sh
-python3 -m unittest discover -s tests -p test_distribution.py -v
-bash -n scripts/package-release.sh
+cargo test --test distribution
 ```
 
 Tests use isolated temporary files and a small executable fixture; they do not

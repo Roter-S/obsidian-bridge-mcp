@@ -24,35 +24,19 @@ jobs:
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Validate tag syntax
-        env:
-          TAG: ${{ inputs.tag }}
-        run: |
-          python3 - <<'PY'
-          import os, re
-          assert re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', os.environ['TAG']), 'invalid version tag'
-          PY
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
-      - name: Check crate version before building
-        env:
-          TAG: ${{ inputs.tag }}
-        run: |
-          python3 - <<'PY'
-          import os, pathlib, tomllib
-          assert tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version'] == os.environ['TAG'][1:], 'tag does not match crate version'
-          PY
       - name: Native tests and build
         run: |
           cargo test --locked
-          cargo build --locked --release --bin obm
+          cargo build --locked --release --bin obm --bin dist
       - name: Package native executable
         env:
           TAG: ${{ inputs.tag }}
           TARGET: ${{ matrix.target }}
-        run: bash scripts/package-release.sh "$TAG" "$TARGET" target/release/obm dist
+        run: target/release/dist package "$TAG" "$TARGET" target/release/obm dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: obm-${{ inputs.tag }}-${{ matrix.target }}
