@@ -65,6 +65,16 @@
 - For tool contract changes, update schemas/descriptions, wire tests, and user documentation together. Cover errors, pagination boundaries, compact output, and path safety; preserve concurrent-create and bounded-work regressions.
 - Tests must not depend on personal vaults or alter installed client/Homebrew configuration. Source changes and local builds do not update installed binaries; do not publish/install unless requested.
 
+## Release Gate and Cleanup
+
+- Do not publish a release until all checks pass on the exact versioned source being released. No failed checks, unresolved errors, formatting differences, or Clippy warnings are acceptable. If code or dependency files change after verification, rerun the checks before proceeding.
+- Required local checks: `cargo fmt --check`, `cargo test --locked`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo build --locked --release`, and `git diff --check`. Apply formatting with `cargo fmt` when needed, then verify again. Review the diff, version/lockfile consistency, user documentation, and compatibility notes before committing and tagging.
+- Wait for every required GitHub Actions job to finish successfully for the intended release tag. Do not publish partial results or proceed while jobs are queued, running, cancelled, or failing. Verify artifact provenance and all archive checksums before publishing assets or updating the Homebrew formula.
+- When an installation upgrade is requested, use the published Homebrew formula and `brew upgrade roter-s/tap/obsidian-bridge-mcp`; do not replace the installed executable with a local build. Verify the installed version through MCP initialization and run `obm doctor` after upgrading.
+- Release work is not complete until its local build artifacts and temporary files are cleaned up, after the required builds, packaging, and smoke checks are finished. Run `cargo clean` for this repository and remove release staging directories, downloaded archives, and generated temporary files created by the operation. On failure or interruption, clean disposable artifacts when safe; explicitly report anything retained for diagnosis or a retry.
+- After a Homebrew upgrade, remove superseded versions and release-related cached downloads for this formula using targeted cleanup (for example, `brew cleanup --prune=0 roter-s/tap/obsidian-bridge-mcp`). Remove any remaining download cache files only when identified as belonging to this operation. Keep the current installed version intact.
+- Never perform broad system cleanup or delete unrelated caches, projects, packages, source files, configuration, or vault data. Confirm the intended files were removed and report validation, CI/publication/installation status, and cleanup accurately; do not claim completion while any required step is pending.
+
 ## Documentation
 
 - `README.md` and `docs/` are user-facing: installation, configuration, tool examples, pagination, compatibility, and troubleshooting.
