@@ -11,12 +11,16 @@ Rust MCP server for connecting Obsidian vaults to AI assistants (Pi, OpenCode, C
 - Safe markdown-only note access
 - MCP tools:
   - `list_vaults`
-  - `list_notes`
-  - `read_note`
-  - `search_notes`
-  - `create_note`
+  - `list_notes` (compact paths by default, optional `details`)
+  - `read_note` (supports optional line `offset` and `limit`)
+  - `get_note_outline` (headings/TOC with line numbers)
+  - `patch_note` (token-efficient find & replace)
+  - `search_notes` (fast parallel search, optional `path_only`)
+  - `get_backlinks` (find wikilinks `[[...]]` pointing to a note)
+  - `list_tags` (all `#tags` and frontmatter tags)
+  - `create_note` (atomic write)
   - `append_note`
-  - `update_note`
+  - `update_note` (atomic write)
 
 ## Installation
 
@@ -89,6 +93,8 @@ For progress updates, append to `Projects/nexus-core-backend/00-Overview.md`.
 
 ## Tool Inputs
 
+> **Note**: `vault` is optional across all tools whenever a single vault is configured.
+
 `list_vaults`
 
 ```json
@@ -101,7 +107,8 @@ For progress updates, append to `Projects/nexus-core-backend/00-Overview.md`.
 {
   "vault": "The Core",
   "folder": "Projects/nexus-core-backend",
-  "limit": 100
+  "limit": 100,
+  "details": false
 }
 ```
 
@@ -110,7 +117,29 @@ For progress updates, append to `Projects/nexus-core-backend/00-Overview.md`.
 ```json
 {
   "vault": "The Core",
+  "path": "Projects/nexus-core-backend/00-Overview.md",
+  "offset": 1,
+  "limit": 50
+}
+```
+
+`get_note_outline`
+
+```json
+{
+  "vault": "The Core",
   "path": "Projects/nexus-core-backend/00-Overview.md"
+}
+```
+
+`patch_note`
+
+```json
+{
+  "vault": "The Core",
+  "path": "Projects/nexus-core-backend/00-Overview.md",
+  "old_text": "status: draft",
+  "new_text": "status: active"
 }
 ```
 
@@ -121,7 +150,26 @@ For progress updates, append to `Projects/nexus-core-backend/00-Overview.md`.
   "vault": "The Core",
   "folder": "Projects/nexus-core-backend",
   "query": "pendiente",
-  "limit": 20
+  "limit": 20,
+  "path_only": false
+}
+```
+
+`get_backlinks`
+
+```json
+{
+  "vault": "The Core",
+  "path": "00-Overview.md",
+  "limit": 50
+}
+```
+
+`list_tags`
+
+```json
+{
+  "vault": "The Core"
 }
 ```
 

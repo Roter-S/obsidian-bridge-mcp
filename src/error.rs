@@ -19,6 +19,10 @@ pub enum ObsidianError {
     VaultMissingObsidianDir(PathBuf),
     #[error("unknown vault `{0}`")]
     UnknownVault(String),
+    #[error("no vaults are configured")]
+    NoVaultsConfigured,
+    #[error("multiple vaults are configured ({0}); please specify vault name")]
+    AmbiguousVault(String),
     #[error("path cannot be empty")]
     EmptyPath,
     #[error("absolute paths are not allowed: {0}")]
@@ -37,6 +41,14 @@ pub enum ObsidianError {
     FolderNotFound(String),
     #[error("note already exists: {0}")]
     NoteAlreadyExists(String),
+    #[error("text to replace cannot be empty")]
+    EmptyPatchText,
+    #[error("text to replace was not found in note `{path}`")]
+    TextNotFoundInNote { path: String },
+    #[error(
+        "text to replace appears {occurrences} times in note `{path}`; provide more surrounding context to ensure uniqueness"
+    )]
+    AmbiguousPatchText { path: String, occurrences: usize },
     #[error("path is not a file: {0}")]
     NotAFile(PathBuf),
     #[error("path is not a directory: {0}")]
