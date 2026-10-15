@@ -28,6 +28,36 @@ fn vault(root: &TempDir, name: &str) -> String {
     format!("{name}={}", path.display())
 }
 #[test]
+fn version_and_help_exit_without_loading_or_creating_configuration() {
+    let root = TempDir::new().unwrap();
+    let config = root.path().join("invalid.json");
+    std::fs::write(&config, "not json").unwrap();
+    for binary in [OBM, OLD] {
+        for flag in ["--version", "-V"] {
+            for args in [vec![flag], vec!["--config", config.to_str().unwrap(), flag]] {
+                let out = run(&root, binary, &args, "");
+                assert_eq!(out.status.code(), Some(0), "{out:?}");
+                assert!(out.stderr.is_empty(), "{out:?}");
+                assert_eq!(
+                    String::from_utf8(out.stdout).unwrap(),
+                    format!("obm {}\n", env!("CARGO_PKG_VERSION"))
+                );
+            }
+        }
+        let out = run(&root, binary, &["--help"], "");
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stderr.is_empty());
+        assert!(
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .contains("-V, --version")
+        );
+    }
+    assert!(!root.path().join("xdg").exists());
+    assert_eq!(std::fs::read_to_string(config).unwrap(), "not json");
+}
+
+#[test]
 fn missing_config_is_actionable_and_noninteractive() {
     let root = TempDir::new().unwrap();
     for binary in [OLD, OBM] {

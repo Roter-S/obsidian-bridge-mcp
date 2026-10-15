@@ -30,8 +30,14 @@ and [configuration guide](configuration.md).
 brew update
 brew upgrade roter-s/tap/obsidian-bridge-mcp
 brew list --versions obsidian-bridge-mcp
+obm --version
 obm doctor
 ```
+
+`obm --version` (or `obm -V`) prints the executable's package version and exits
+without loading vault configuration or starting the MCP server. This reports the
+binary you invoked, which may differ from the version installed by Homebrew if
+another installation is earlier on your `PATH`.
 
 Upgrading replaces the executable, not your shared vault configuration. Do not
 run setup again unless you want to change that configuration.

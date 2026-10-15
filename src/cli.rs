@@ -5,7 +5,11 @@ use clap::{Parser, Subcommand};
 use crate::error::ObsidianError;
 
 #[derive(Debug, Parser)]
-#[command(about = "MCP server for Obsidian vaults; run obm setup to configure vaults")]
+#[command(
+    name = "obm",
+    version,
+    about = "MCP server for Obsidian vaults; run obm setup to configure vaults"
+)]
 pub struct Cli {
     /// Vault definition in the form [NAME=]/absolute/path/to/vault
     #[arg(long = "vault", value_name = "[NAME=]PATH", global = true)]
@@ -79,6 +83,20 @@ mod tests {
     use clap::Parser;
 
     use super::Cli;
+
+    #[test]
+    fn version_flags_use_package_version_and_exit_successfully() {
+        for flag in ["--version", "-V"] {
+            let result = Cli::try_parse_from(["obm", flag]).unwrap_err();
+            assert_eq!(result.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert_eq!(result.exit_code(), 0);
+            assert!(!result.use_stderr());
+            assert_eq!(
+                result.to_string(),
+                format!("obm {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+    }
 
     #[test]
     fn parses_multiple_vaults() {
