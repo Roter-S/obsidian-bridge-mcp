@@ -130,6 +130,8 @@ To continue, call the same tool with the same filters and pass `next_offset` as 
 
 Stop when `has_more` is false, or as soon as you have enough information for your task. Do not reuse an offset with different filters. If notes change between calls, page contents can shift; restart the listing if you need to check the current results again.
 
+Compact listings, searches, and backlinks traverse folders as needed and stop after filling the page plus one continuation result. A partial page does not validate unvisited subfolders or unread note content; later pages can report an I/O or symlink error when that part of the vault is reached. Encountered errors are not silently skipped. Detailed listings must inspect metadata across the selected folder to find the newest notes, and tag counts require a full-vault scan. Results are read from the filesystem on each request, not from a persistent index.
+
 ## Make targeted edits
 
 Use `patch_note` for a small change instead of sending the entire document:

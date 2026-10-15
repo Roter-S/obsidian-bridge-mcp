@@ -25,6 +25,7 @@
 - List tests: `cargo test -- --list`.
 - Run a filtered test: `cargo test vault::tests::search_notes_returns_matches`.
 - Run the public MCP wire-contract tests: `cargo test --test mcp_contract`.
+- Run opt-in synthetic performance measurements: `cargo test --locked --release vault::benchmarks::synthetic_vault -- --ignored --nocapture`. The benchmark uses temporary vaults with 2,000 and 20,000 notes, warmed filesystem caches, and nine samples per operation; it is not a cold-disk or end-to-end MCP benchmark. Compare the same workload and environment before claiming improvements.
 
 ## Configuration and Transport
 
@@ -50,8 +51,11 @@
 
 ## Filesystem Work and Writes
 
-- Search/backlinks stream lines and stop after filling the requested page (including pagination lookahead). Avoid unbounded per-file tasks or accumulated match vectors.
-- Range reads retain selected lines rather than the full note; they still scan to count total lines. Tag extraction has at most 32 active tasks.
+- Compact lists/search/backlinks traverse lazily in stable order and stop after filling the requested page (including pagination lookahead). Sort only visited directory entries, not an accumulated whole-vault path vector. Preserve compact String path order and legacy component-wise Path order for search/backlinks, including punctuation and directory-prefix cases. Errors in visited paths must propagate; partial pages do not prevalidate unvisited subtrees.
+- Detailed lists must examine all selected note metadata, but retain only the best requested prefix in a top-K heap before sorting the retained results. Do not allocate capacity directly from an unchecked limit or offset.
+- Tag discovery runs in finite batches of at most 32 pending paths, with at most 32 extraction tasks. Do not block a shared-pool worker on a full producer channel: extraction must also finish with a single blocking thread. Avoid unbounded per-file tasks or accumulated match vectors.
+- Batch read-only filesystem scans on the blocking pool, not on async runtime workers or through a separate scheduled read for every small operation. Preserve cooperative cancellation between directory entries and lines; an in-flight filesystem call is not interruptible.
+- Range reads retain selected lines rather than the full note; they still scan to count total lines. Outline and tag extraction also stream lines. Tag extraction has at most 32 active tasks and retains distinct tags per note, not full bodies or every repeated occurrence.
 - Line limits are not byte/token limits. Do not silently discard note content to claim a hard output ceiling.
 - `create_note` creates parent folders and must fail if the destination exists, including under concurrent creation. Preserve atomic no-replace publication; an existence check followed by overwrite-capable rename is insufficient.
 - `append_note`, `update_note`, and `patch_note` require an existing note. A patch requires exactly one matching snippet. Updates and patches use atomic replacement.

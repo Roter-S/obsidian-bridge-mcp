@@ -1,15 +1,23 @@
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::OsStr;
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use walkdir::WalkDir;
 
 use crate::cli::VaultSpec;
 use crate::error::ObsidianError;
+
+#[cfg(test)]
+#[path = "vault_bench.rs"]
+mod benchmarks;
 
 #[derive(Debug, Clone)]
 pub struct VaultRegistry {
@@ -35,6 +43,22 @@ pub struct NoteInfo {
     pub modified: String,
     #[schemars(with = "i64")]
     pub size: u64,
+}
+
+// A max-heap keeps the worst retained candidate on top: oldest modified string,
+// then greatest path. Match the existing response ordering, including tie breaks.
+#[derive(Eq, PartialEq, Ord, PartialOrd)]
+struct NoteCandidate {
+    modified: Reverse<String>,
+    path: String,
+    size: u64,
+}
+
+#[derive(Clone, Copy)]
+enum TraversalOrder {
+    Components,
+    Lexical,
+    Unordered,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -155,36 +179,58 @@ impl Vault {
         folder: Option<&str>,
         limit: usize,
     ) -> Result<Vec<NoteInfo>, ObsidianError> {
-        let base = self.resolve_folder_path(folder)?;
-        let mut notes = Vec::new();
+        let folder = folder.map(str::to_owned);
+        self.blocking(move |vault, cancelled| {
+            vault.list_notes_blocking(folder.as_deref(), limit, cancelled)
+        })
+        .await
+    }
 
-        for entry in self.walk_markdown_files(&base)? {
+    fn list_notes_blocking(
+        &self,
+        folder: Option<&str>,
+        limit: usize,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<Vec<NoteInfo>, ObsidianError> {
+        let base = self.resolve_folder_path(folder)?;
+        let mut notes: BinaryHeap<NoteCandidate> = BinaryHeap::new();
+
+        // Newest-first requires examining every note, but only retain the best
+        // `limit` candidates. Do not allocate capacity from an untrusted limit.
+        for entry in self.walk_markdown_files(&base, cancelled, TraversalOrder::Unordered) {
+            let entry = entry?;
             let metadata = entry
                 .metadata()
                 .map_err(|error| ObsidianError::Io(std::io::Error::other(error)))?;
             let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            notes.push(NoteInfo {
+            let candidate = NoteCandidate {
+                modified: Reverse(DateTime::<Utc>::from(modified).to_rfc3339()),
                 path: self.relative_string(entry.path())?,
-                title: entry
-                    .path()
+                size: metadata.len(),
+            };
+            if notes.len() < limit {
+                notes.push(candidate);
+            } else if let Some(mut worst) = notes.peek_mut()
+                && candidate < *worst
+            {
+                *worst = candidate;
+            }
+        }
+
+        Ok(notes
+            .into_sorted_vec()
+            .into_iter()
+            .map(|note| NoteInfo {
+                title: Path::new(&note.path)
                     .file_stem()
                     .and_then(OsStr::to_str)
                     .unwrap_or_default()
-                    .to_string(),
-                modified: DateTime::<Utc>::from(modified).to_rfc3339(),
-                size: metadata.len(),
-            });
-        }
-
-        notes.sort_by(|left, right| {
-            right
-                .modified
-                .cmp(&left.modified)
-                .then(left.path.cmp(&right.path))
-        });
-        notes.truncate(limit);
-
-        Ok(notes)
+                    .to_owned(),
+                path: note.path,
+                modified: note.modified.0,
+                size: note.size,
+            })
+            .collect())
     }
 
     pub async fn list_note_paths(
@@ -192,18 +238,32 @@ impl Vault {
         folder: Option<&str>,
         limit: usize,
     ) -> Result<Vec<String>, ObsidianError> {
+        let folder = folder.map(str::to_owned);
+        self.blocking(move |vault, cancelled| {
+            vault.list_note_paths_blocking(folder.as_deref(), limit, cancelled)
+        })
+        .await
+    }
+
+    fn list_note_paths_blocking(
+        &self,
+        folder: Option<&str>,
+        limit: usize,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<Vec<String>, ObsidianError> {
         let base = self.resolve_folder_path(folder)?;
         let mut paths = Vec::new();
 
-        for entry in self.walk_markdown_files(&base)? {
-            paths.push(self.relative_string(entry.path())?);
+        for entry in self
+            .walk_markdown_files(&base, cancelled, TraversalOrder::Lexical)
+            .take(limit)
+        {
+            paths.push(self.relative_string(entry?.path())?);
         }
-
-        paths.sort();
-        paths.truncate(limit);
         Ok(paths)
     }
 
+    #[cfg(test)]
     pub async fn read_note(&self, path: &str) -> Result<String, ObsidianError> {
         let path = self.resolve_note_path(path, true)?;
         fs::read_to_string(&path)
@@ -217,73 +277,63 @@ impl Vault {
         offset: Option<usize>,
         limit: Option<usize>,
     ) -> Result<(String, usize, usize), ObsidianError> {
-        let full_path = self.resolve_note_path(path, true)?;
-        let file = fs::File::open(&full_path)
-            .await
-            .map_err(|source| ObsidianError::ReadNote {
-                path: full_path.clone(),
-                source,
+        let path = path.to_owned();
+        self.blocking(move |vault, cancelled| {
+            let full_path = vault.resolve_note_path(&path, true)?;
+            let start = offset.unwrap_or(1).max(1);
+            let count = limit.unwrap_or(usize::MAX);
+            let mut selected = String::new();
+            let mut lines_read = 0;
+            let total_lines = scan_note_lines(&full_path, cancelled, |number, line| {
+                if number >= start && lines_read < count {
+                    if lines_read > 0 {
+                        selected.push('\n');
+                    }
+                    selected.push_str(line);
+                    lines_read += 1;
+                }
+                true
             })?;
-        let mut lines = BufReader::new(file).lines();
-        let start = offset.unwrap_or(1).max(1).saturating_sub(1);
-        let count = limit.unwrap_or(usize::MAX);
-        let mut total_lines = 0;
-        let mut selected = Vec::new();
-        while let Some(line) =
-            lines
-                .next_line()
-                .await
-                .map_err(|source| ObsidianError::ReadNote {
-                    path: full_path.clone(),
-                    source,
-                })?
-        {
-            if total_lines >= start && selected.len() < count {
-                selected.push(line);
-            }
-            total_lines += 1;
-        }
-        let lines_read = selected.len();
-        Ok((selected.join("\n"), total_lines, lines_read))
+            Ok((selected, total_lines, lines_read))
+        })
+        .await
     }
 
     pub async fn get_note_outline(
         &self,
         path: &str,
     ) -> Result<(Vec<HeadingItem>, usize), ObsidianError> {
-        let content = self.read_note(path).await?;
-        let mut headings = Vec::new();
-        let mut total_lines = 0;
-        let mut in_code_block = false;
-
-        for (idx, line) in content.lines().enumerate() {
-            total_lines += 1;
-            let trimmed = line.trim();
-            if trimmed.starts_with("```") {
-                in_code_block = !in_code_block;
-                continue;
-            }
-            if in_code_block {
-                continue;
-            }
-
-            let trimmed_start = line.trim_start();
-            if trimmed_start.starts_with('#') {
-                let hashes = trimmed_start.chars().take_while(|&c| c == '#').count();
+        let path = path.to_owned();
+        self.blocking(move |vault, cancelled| {
+            let full_path = vault.resolve_note_path(&path, true)?;
+            let mut headings = Vec::new();
+            let mut in_code_block = false;
+            let total_lines = scan_note_lines(&full_path, cancelled, |number, line| {
+                let trimmed = line.trim();
+                if trimmed.starts_with("```") {
+                    in_code_block = !in_code_block;
+                    return true;
+                }
+                if in_code_block {
+                    return true;
+                }
+                let trimmed_start = line.trim_start();
+                let hashes = trimmed_start.bytes().take_while(|&c| c == b'#').count();
                 if (1..=6).contains(&hashes) {
                     let rest = &trimmed_start[hashes..];
                     if rest.starts_with(' ') || rest.is_empty() {
                         headings.push(HeadingItem {
                             level: hashes as u8,
                             text: rest.trim().to_string(),
-                            line: idx + 1,
+                            line: number,
                         });
                     }
                 }
-            }
-        }
-
-        Ok((headings, total_lines))
+                true
+            })?;
+            Ok((headings, total_lines))
+        })
+        .await
     }
 
     /// Ordered by path, then line. Only the requested page is retained.
@@ -294,6 +344,30 @@ impl Vault {
         limit: usize,
         path_only: bool,
         offset: usize,
+    ) -> Result<Vec<SearchMatch>, ObsidianError> {
+        let folder = folder.map(str::to_owned);
+        let query = query.to_owned();
+        self.blocking(move |vault, cancelled| {
+            vault.search_notes_blocking(
+                folder.as_deref(),
+                &query,
+                limit,
+                path_only,
+                offset,
+                cancelled,
+            )
+        })
+        .await
+    }
+
+    fn search_notes_blocking(
+        &self,
+        folder: Option<&str>,
+        query: &str,
+        limit: usize,
+        path_only: bool,
+        offset: usize,
+        cancelled: &Arc<AtomicBool>,
     ) -> Result<Vec<SearchMatch>, ObsidianError> {
         let query = query.trim();
         if query.is_empty() {
@@ -307,7 +381,8 @@ impl Vault {
         let mut matches = Vec::new();
         let mut skipped = 0;
 
-        for entry in self.walk_markdown_files(&base)? {
+        for entry in self.walk_markdown_files(&base, cancelled, TraversalOrder::Components) {
+            let entry = entry?;
             let rel = self.relative_string(entry.path())?;
             if path_only {
                 if contains_ignore_case(&rel, &needle) {
@@ -322,41 +397,20 @@ impl Vault {
                     });
                 }
             } else {
-                let path = entry.path();
-                let file =
-                    fs::File::open(path)
-                        .await
-                        .map_err(|source| ObsidianError::ReadNote {
-                            path: path.to_path_buf(),
-                            source,
-                        })?;
-                let mut lines = BufReader::new(file).lines();
-                let mut line_number = 0;
-                while let Some(line) =
-                    lines
-                        .next_line()
-                        .await
-                        .map_err(|source| ObsidianError::ReadNote {
-                            path: path.to_path_buf(),
-                            source,
-                        })?
-                {
-                    line_number += 1;
-                    if contains_ignore_case(&line, &needle) {
+                scan_note_lines(entry.path(), cancelled, |line_number, line| {
+                    if contains_ignore_case(line, &needle) {
                         if skipped < offset {
                             skipped += 1;
-                            continue;
+                            return true;
                         }
                         matches.push(SearchMatch {
                             path: rel.clone(),
                             line: line_number,
                             excerpt: compact_excerpt(line.trim()),
                         });
-                        if matches.len() >= limit {
-                            return Ok(matches);
-                        }
                     }
-                }
+                    matches.len() < limit
+                })?;
             }
             if matches.len() >= limit {
                 break;
@@ -435,6 +489,20 @@ impl Vault {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<BacklinkMatch>, ObsidianError> {
+        let target = target_path_or_title.to_owned();
+        self.blocking(move |vault, cancelled| {
+            vault.get_backlinks_blocking(&target, limit, offset, cancelled)
+        })
+        .await
+    }
+
+    fn get_backlinks_blocking(
+        &self,
+        target_path_or_title: &str,
+        limit: usize,
+        offset: usize,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<Vec<BacklinkMatch>, ObsidianError> {
         let target = target_path_or_title.trim();
         if target.is_empty() {
             return Err(ObsidianError::EmptyPath);
@@ -457,7 +525,8 @@ impl Vault {
         }
         let mut backlinks = Vec::new();
         let mut skipped = 0;
-        for entry in self.walk_markdown_files(&self.root)? {
+        for entry in self.walk_markdown_files(&self.root, cancelled, TraversalOrder::Components) {
+            let entry = entry?;
             let rel = self.relative_string(entry.path())?;
             let rel_norm = rel.strip_suffix(".md").unwrap_or(&rel).to_lowercase();
             let rel_stem = Path::new(&rel)
@@ -468,66 +537,72 @@ impl Vault {
             if rel_stem == stem || rel_norm == target_norm {
                 continue;
             }
-            let path = entry.path();
-            let file = fs::File::open(path)
-                .await
-                .map_err(|source| ObsidianError::ReadNote {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-            let mut lines = BufReader::new(file).lines();
-            let mut line_number = 0;
-            while let Some(line) =
-                lines
-                    .next_line()
-                    .await
-                    .map_err(|source| ObsidianError::ReadNote {
-                        path: path.to_path_buf(),
-                        source,
-                    })?
-            {
-                line_number += 1;
-                if line.contains("[[") && line_contains_wikilink_to(&line, &stem, &target_norm) {
+            scan_note_lines(entry.path(), cancelled, |line_number, line| {
+                if line.contains("[[") && line_contains_wikilink_to(line, &stem, &target_norm) {
                     if skipped < offset {
                         skipped += 1;
-                        continue;
+                        return true;
                     }
                     backlinks.push(BacklinkMatch {
                         source_path: rel.clone(),
                         line: line_number,
                         excerpt: compact_excerpt(line.trim()),
                     });
-                    if backlinks.len() >= limit {
-                        return Ok(backlinks);
-                    }
                 }
+                backlinks.len() < limit
+            })?;
+            if backlinks.len() >= limit {
+                return Ok(backlinks);
             }
         }
         Ok(backlinks)
     }
 
     pub async fn list_tags(&self) -> Result<Vec<TagInfo>, ObsidianError> {
-        let mut entries = self.walk_markdown_files(&self.root)?.into_iter();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _guard = CancelOnDrop(cancelled.clone());
+        let mut entries =
+            self.walk_markdown_files(&self.root, &cancelled, TraversalOrder::Unordered);
+        let mut pending = Vec::new().into_iter();
         let mut join_set = tokio::task::JoinSet::new();
-        let read_tags = |path: PathBuf| async move {
-            let content = fs::read_to_string(&path)
-                .await
-                .map_err(|source| ObsidianError::ReadNote { path, source })?;
-            Ok::<_, ObsidianError>(extract_tags_from_content(&content))
-        };
-        // Bound tasks as well as open files; replenish only after a task completes.
-        for entry in entries.by_ref().take(32) {
-            join_set.spawn(read_tags(entry.into_path()));
-        }
+        let mut discovery_done = false;
         let mut tag_counts: HashMap<String, usize> = HashMap::new();
-        while let Some(result) = join_set.join_next().await {
-            let tags =
-                result.map_err(|error| ObsidianError::Io(std::io::Error::other(error)))??;
-            for tag in tags {
-                *tag_counts.entry(tag).or_insert(0) += 1;
+        while !discovery_done || pending.len() > 0 || !join_set.is_empty() {
+            if pending.len() == 0 && !discovery_done {
+                // A finite batch never waits on another blocking task. A producer
+                // blocked on a full channel can starve a single-thread pool.
+                let (remaining, paths) = tokio::task::spawn_blocking(move || {
+                    let paths = entries
+                        .by_ref()
+                        .take(32)
+                        .map(|entry| entry.map(walkdir::DirEntry::into_path))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<_, ObsidianError>((entries, paths))
+                })
+                .await
+                .map_err(|error| ObsidianError::Io(std::io::Error::other(error)))??;
+                entries = remaining;
+                discovery_done = paths.len() < 32;
+                pending = paths.into_iter();
             }
-            if let Some(entry) = entries.next() {
-                join_set.spawn(read_tags(entry.into_path()));
+            while join_set.len() < 32 {
+                let Some(path) = pending.next() else { break };
+                let cancelled = cancelled.clone();
+                join_set.spawn_blocking(move || {
+                    let mut parser = TagParser::default();
+                    scan_note_lines(&path, &cancelled, |_, line| {
+                        parser.push_line(line);
+                        true
+                    })?;
+                    Ok::<_, ObsidianError>(parser.tags)
+                });
+            }
+            if let Some(result) = join_set.join_next().await {
+                let tags =
+                    result.map_err(|error| ObsidianError::Io(std::io::Error::other(error)))??;
+                for tag in tags {
+                    *tag_counts.entry(tag).or_insert(0) += 1;
+                }
             }
         }
 
@@ -658,26 +733,87 @@ impl Vault {
         Ok(current)
     }
 
-    fn walk_markdown_files(&self, base: &Path) -> Result<Vec<walkdir::DirEntry>, ObsidianError> {
-        let mut files = Vec::new();
+    // Batch filesystem work off the async workers, including directory traversal.
+    async fn blocking<T, F>(&self, work: F) -> Result<T, ObsidianError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self, &Arc<AtomicBool>) -> Result<T, ObsidianError> + Send + 'static,
+    {
+        let vault = self.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _guard = CancelOnDrop(cancelled.clone());
+        tokio::task::spawn_blocking(move || work(vault, &cancelled))
+            .await
+            .map_err(|error| ObsidianError::Io(std::io::Error::other(error)))?
+    }
 
-        for entry in WalkDir::new(base)
-            .follow_links(false)
+    fn walk_markdown_files(
+        &self,
+        base: &Path,
+        cancelled: &Arc<AtomicBool>,
+        order: TraversalOrder,
+    ) -> impl Iterator<Item = Result<walkdir::DirEntry, ObsidianError>> + Send + 'static + use<>
+    {
+        let cancelled = cancelled.clone();
+        let walker = WalkDir::new(base).follow_links(false);
+        let walker = match order {
+            TraversalOrder::Unordered => walker,
+            _ => walker.sort_by(move |left, right| match order {
+                TraversalOrder::Lexical => {
+                    // Include '/' in directory sort keys. Otherwise DFS puts
+                    // a/child.md before a.md, unlike the compact String ordering.
+                    left.file_name()
+                        .as_encoded_bytes()
+                        .iter()
+                        .copied()
+                        .chain(left.file_type().is_dir().then_some(b'/'))
+                        .cmp(
+                            right
+                                .file_name()
+                                .as_encoded_bytes()
+                                .iter()
+                                .copied()
+                                .chain(right.file_type().is_dir().then_some(b'/')),
+                        )
+                }
+                _ => left.file_name().cmp(right.file_name()),
+            }),
+        };
+        let mut entries = walker
             .into_iter()
-            .filter_entry(|entry| !is_ignored_dir(entry.path()))
-        {
-            let entry = entry.map_err(|error| ObsidianError::Io(std::io::Error::other(error)))?;
-            if entry.file_type().is_symlink() {
-                return Err(ObsidianError::SymlinkNotAllowed(entry.path().to_path_buf()));
+            .filter_entry(|entry| !is_ignored_dir(entry.path()));
+        let mut finished = false;
+        std::iter::from_fn(move || {
+            if finished {
+                return None;
             }
-
-            if entry.file_type().is_file() && is_markdown(entry.path()) {
-                files.push(entry);
+            let result = (|| loop {
+                // Check before advancing: advancing may read/sort a directory.
+                check_cancelled(&cancelled)?;
+                let Some(entry) = entries.next() else {
+                    return Ok(None);
+                };
+                let entry =
+                    entry.map_err(|error| ObsidianError::Io(std::io::Error::other(error)))?;
+                if entry.file_type().is_symlink() {
+                    return Err(ObsidianError::SymlinkNotAllowed(entry.path().to_path_buf()));
+                }
+                if entry.file_type().is_file() && is_markdown(entry.path()) {
+                    return Ok(Some(entry));
+                }
+            })();
+            match result {
+                Ok(Some(entry)) => Some(Ok(entry)),
+                Ok(None) => {
+                    finished = true;
+                    None
+                }
+                Err(error) => {
+                    finished = true;
+                    Some(Err(error))
+                }
             }
-        }
-
-        files.sort_by(|a, b| a.path().cmp(b.path()));
-        Ok(files)
+        })
     }
 
     fn relative_string(&self, path: &Path) -> Result<String, ObsidianError> {
@@ -685,6 +821,58 @@ impl Vault {
             .strip_prefix(&self.root)
             .map_err(|_| ObsidianError::PathTraversal(path_to_string(path)))?;
         Ok(path_to_string(relative))
+    }
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), ObsidianError> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(ObsidianError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "vault scan cancelled",
+        )));
+    }
+    Ok(())
+}
+
+// Reuse one UTF-8 line buffer. Returning false stops before the rest of the note.
+fn scan_note_lines(
+    path: &Path,
+    cancelled: &AtomicBool,
+    mut visit: impl FnMut(usize, &str) -> bool,
+) -> Result<usize, ObsidianError> {
+    let read_error = |source| ObsidianError::ReadNote {
+        path: path.to_path_buf(),
+        source,
+    };
+    check_cancelled(cancelled)?;
+    let file = std::fs::File::open(path).map_err(read_error)?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut number = 0;
+    loop {
+        check_cancelled(cancelled)?;
+        line.clear();
+        if reader.read_line(&mut line).map_err(read_error)? == 0 {
+            return Ok(number);
+        }
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        number += 1;
+        if !visit(number, &line) {
+            return Ok(number);
+        }
     }
 }
 
@@ -741,103 +929,98 @@ fn line_contains_wikilink_to(line: &str, target_stem_lower: &str, target_norm_lo
     false
 }
 
-fn extract_tags_from_content(content: &str) -> Vec<String> {
-    let mut tags = Vec::new();
-    let lines: Vec<&str> = content.lines().collect();
-    let mut line_idx = 0;
+// State spans lines, not note bodies. Retain only distinct tags per note so a
+// repeated tag counts once without retaining every occurrence before deduplication.
+#[derive(Default)]
+struct TagParser {
+    tags: HashSet<String>,
+    started: bool,
+    in_frontmatter: bool,
+    in_tags_list: bool,
+    in_code_block: bool,
+}
 
-    if let Some(&first_line) = lines.first()
-        && first_line.trim() == "---"
-    {
-        line_idx = 1;
-        let mut in_tags_list = false;
-        while line_idx < lines.len() {
-            let line = lines[line_idx];
-            if line.trim() == "---" {
-                line_idx += 1;
-                break;
+impl TagParser {
+    fn insert(&mut self, candidate: &str) {
+        if is_valid_tag_name(candidate) {
+            self.tags.insert(candidate.to_lowercase());
+        }
+    }
+
+    fn push_line(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if !self.started {
+            self.started = true;
+            if trimmed == "---" {
+                self.in_frontmatter = true;
+                return;
             }
-            let trimmed = line.trim();
+        }
+        if self.in_frontmatter {
+            if trimmed == "---" {
+                self.in_frontmatter = false;
+                return;
+            }
             if trimmed.starts_with("tags:") || trimmed.starts_with("tag:") {
                 let rest = trimmed.split_once(':').map(|(_, r)| r.trim()).unwrap_or("");
                 if rest.starts_with('[') && rest.ends_with(']') {
-                    let inside = &rest[1..rest.len() - 1];
-                    for item in inside.split(',') {
-                        let clean = item.trim().trim_matches(['\'', '"', '#']);
-                        if is_valid_tag_name(clean) {
-                            tags.push(clean.to_lowercase());
-                        }
+                    for item in rest[1..rest.len() - 1].split(',') {
+                        self.insert(item.trim().trim_matches(['\'', '"', '#']));
                     }
                 } else if !rest.is_empty() {
-                    let clean = rest.trim_matches(['\'', '"', '#']);
-                    if is_valid_tag_name(clean) {
-                        tags.push(clean.to_lowercase());
-                    }
+                    self.insert(rest.trim_matches(['\'', '"', '#']));
                 } else {
-                    in_tags_list = true;
+                    self.in_tags_list = true;
                 }
-            } else if in_tags_list {
+            } else if self.in_tags_list {
                 if trimmed.starts_with('-') {
-                    let item = trimmed.trim_start_matches('-').trim();
-                    let clean = item.trim_matches(['\'', '"', '#']);
-                    if is_valid_tag_name(clean) {
-                        tags.push(clean.to_lowercase());
-                    }
+                    self.insert(
+                        trimmed
+                            .trim_start_matches('-')
+                            .trim()
+                            .trim_matches(['\'', '"', '#']),
+                    );
                 } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                    in_tags_list = false;
+                    self.in_tags_list = false;
                 }
             }
-            line_idx += 1;
+            return;
         }
-    }
-
-    let mut in_code_block = false;
-    for &line in &lines[line_idx..] {
-        let trimmed = line.trim();
         if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
+            self.in_code_block = !self.in_code_block;
+            return;
         }
-        if in_code_block {
-            continue;
+        if self.in_code_block {
+            return;
         }
 
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '#' {
-                let prev_ok = i == 0
-                    || chars[i - 1].is_whitespace()
-                    || chars[i - 1] == '('
-                    || chars[i - 1] == '[';
-                if prev_ok
-                    && i + 1 < chars.len()
-                    && !chars[i + 1].is_whitespace()
-                    && chars[i + 1] != '#'
-                {
-                    let mut j = i + 1;
-                    while j < chars.len()
-                        && (chars[j].is_alphanumeric()
-                            || chars[j] == '_'
-                            || chars[j] == '-'
-                            || chars[j] == '/')
-                    {
-                        j += 1;
-                    }
-                    let tag_candidate: String = chars[i + 1..j].iter().collect();
-                    if is_valid_tag_name(&tag_candidate) {
-                        tags.push(tag_candidate.to_lowercase());
-                    }
-                    i = j;
-                    continue;
-                }
+        // Find ASCII delimiters by byte; decode Unicode only around actual tags.
+        for (index, _) in line.match_indices('#') {
+            let prev_ok = line[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c.is_whitespace() || c == '(' || c == '[');
+            if !prev_ok {
+                continue;
             }
-            i += 1;
+            let rest = &line[index + 1..];
+            let end = rest
+                .char_indices()
+                .find(|&(_, c)| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '/'))
+                .map_or(rest.len(), |(index, _)| index);
+            self.insert(&rest[..end]);
         }
     }
+}
 
+#[cfg(test)]
+fn extract_tags_from_content(content: &str) -> Vec<String> {
+    let mut parser = TagParser::default();
+    for line in content.lines() {
+        parser.push_line(line);
+    }
+    let mut tags: Vec<_> = parser.tags.into_iter().collect();
     tags.sort();
-    tags.dedup();
     tags
 }
 
@@ -889,13 +1072,18 @@ fn normalize_relative_path(raw: &str, require_markdown: bool) -> Result<PathBuf,
 }
 
 fn path_to_string(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => value.to_str().map(ToOwned::to_owned),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut result = String::new();
+    for component in path.components() {
+        if let Component::Normal(value) = component
+            && let Some(value) = value.to_str()
+        {
+            if !result.is_empty() {
+                result.push('/');
+            }
+            result.push_str(value);
+        }
+    }
+    result
 }
 
 fn is_markdown(path: &Path) -> bool {
@@ -1172,6 +1360,360 @@ mod tests {
         assert!(tags.iter().any(|t| t.tag == "mcp" && t.count == 1));
         assert!(tags.iter().any(|t| t.tag == "dev/backend" && t.count == 1));
         assert!(tags.iter().any(|t| t.tag == "notes" && t.count == 1));
+    }
+
+    #[tokio::test]
+    async fn streaming_read_preserves_line_endings_and_reports_invalid_utf8() {
+        let (temp, vault) = temp_vault("streaming");
+        for content in ["", "\n", "a\r\nb\n\nlast\r", "café\n日本語\n", "\r\n\r\n"] {
+            fs::write(temp.path().join("lines.md"), content).unwrap();
+            let expected: Vec<_> = content.lines().collect();
+            for offset in [0, 1, 2, 99, usize::MAX] {
+                for limit in [0, 1, 10] {
+                    let actual = vault
+                        .read_note_range("lines.md", Some(offset), Some(limit))
+                        .await
+                        .unwrap();
+                    let selected: Vec<_> = expected
+                        .iter()
+                        .skip(offset.max(1) - 1)
+                        .take(limit)
+                        .copied()
+                        .collect();
+                    assert_eq!(
+                        actual,
+                        (selected.join("\n"), expected.len(), selected.len())
+                    );
+                }
+            }
+        }
+        fs::write(temp.path().join("lines.md"), b"match\n\xff\n").unwrap();
+        let matches = vault
+            .search_notes(None, "match", 1, false, 0)
+            .await
+            .unwrap();
+        assert_eq!(matches.len(), 1); // Do not validate unread later lines.
+        assert!(matches!(
+            vault.read_note_range("lines.md", Some(1), Some(1)).await,
+            Err(ObsidianError::ReadNote { .. })
+        ));
+        assert!(matches!(
+            vault.get_note_outline("lines.md").await,
+            Err(ObsidianError::ReadNote { .. })
+        ));
+        assert!(matches!(
+            vault.get_backlinks("Absent", 1, 0).await,
+            Err(ObsidianError::ReadNote { .. })
+        ));
+        assert!(matches!(
+            vault.list_tags().await,
+            Err(ObsidianError::ReadNote { .. })
+        ));
+    }
+
+    #[test]
+    fn streaming_scan_stops_when_cancelled() {
+        let (temp, _) = temp_vault("cancel");
+        let path = temp.path().join("lines.md");
+        fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let cancelled = super::AtomicBool::new(false);
+        let mut visited = 0;
+        let result = super::scan_note_lines(&path, &cancelled, |_, _| {
+            visited += 1;
+            cancelled.store(true, super::Ordering::Relaxed);
+            true
+        });
+        assert_eq!(visited, 1);
+        assert!(
+            matches!(result, Err(ObsidianError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_scans_yield_to_runtime_and_cancel_on_drop() {
+        let (_temp, vault) = temp_vault("cancel");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let scan = tokio::spawn(async move {
+            vault
+                .blocking(move |_, cancelled| {
+                    let _ = started_tx.send(());
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while !cancelled.load(super::Ordering::Relaxed)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    let _ = stopped_tx.send(cancelled.load(super::Ordering::Relaxed));
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        scan.abort();
+        assert!(scan.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), stopped_rx)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn tag_parser_preserves_unicode_boundaries_frontmatter_and_code_fences() {
+        let tags = super::extract_tags_from_content(
+            "---\ntags:\n  - Rust\n  - 'mcp'\n---\n# Title\n#rust (#CAFÉ) [#日本語] x#not-a-tag\n\u{2003}#dev/backend #123 #/bad #bad/ ##no\n```rust\n#ignored\n```\n#tag-name #tag_name\n",
+        );
+        assert_eq!(
+            tags,
+            [
+                "café",
+                "dev/backend",
+                "mcp",
+                "rust",
+                "tag-name",
+                "tag_name",
+                "日本語"
+            ]
+        );
+        assert_eq!(
+            super::extract_tags_from_content("---\ntag: '#Solo'\n---\n#solo"),
+            ["solo"]
+        );
+        assert!(super::extract_tags_from_content("---\n#unclosed-frontmatter").is_empty());
+    }
+
+    #[test]
+    fn tag_parser_retains_only_distinct_tags_across_many_lines() {
+        let mut parser = super::TagParser::default();
+        for _ in 0..10_000 {
+            parser.push_line("#rust #Rust #dev/backend #日本語");
+            assert_eq!(parser.tags.len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_traversal_preserves_string_and_component_order_across_pages() {
+        let (temp, vault) = temp_vault("ordering");
+        let paths = [
+            "a.md",
+            "a/child.md",
+            "a/sub/deep.md",
+            "a!/child.md",
+            "a-.md",
+            "a./child.md",
+            "a0.md",
+            "a_/child.md",
+            "a..md",
+            "a.z.md",
+            "B.md",
+            "é.md",
+            "é/child.md",
+            "日本語.md",
+            "日本語/child.md",
+            "nested/a.md",
+            "nested/a/child.md",
+            "nested/a0.md",
+        ];
+        for path in paths {
+            let full = temp.path().join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, "match [[Target]]").unwrap();
+        }
+        let mut lexical: Vec<_> = paths.iter().map(|p| p.to_string()).collect();
+        lexical.sort();
+        let mut components = lexical.clone();
+        components.sort_by(|a, b| std::path::Path::new(a).cmp(std::path::Path::new(b)));
+        assert_ne!(lexical, components); // Exercise the subtle a.md / a/ ordering.
+        for limit in [0, 1, 5, paths.len(), paths.len() + 1, usize::MAX] {
+            assert_eq!(
+                vault.list_note_paths(None, limit).await.unwrap(),
+                lexical.iter().take(limit).cloned().collect::<Vec<_>>()
+            );
+            for offset in [0, 1, 5, paths.len(), usize::MAX] {
+                let expected: Vec<_> = components
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .cloned()
+                    .collect();
+                for path_only in [false, true] {
+                    let query = if path_only { ".md" } else { "match" };
+                    let actual = vault
+                        .search_notes(None, query, limit, path_only, offset)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        actual.into_iter().map(|m| m.path).collect::<Vec<_>>(),
+                        expected
+                    );
+                }
+                let actual = vault.get_backlinks("Target", limit, offset).await.unwrap();
+                assert_eq!(
+                    actual
+                        .into_iter()
+                        .map(|m| m.source_path)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+        let nested = vault
+            .list_note_paths(Some("nested"), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(nested, ["nested/a.md", "nested/a/child.md", "nested/a0.md"]);
+    }
+
+    #[tokio::test]
+    async fn detailed_top_k_matches_exhaustive_sort_with_timestamp_ties() {
+        let (temp, vault) = temp_vault("top-k");
+        let mut expected = Vec::new();
+        for index in 0..150 {
+            let path = format!("note-{index:03}.md");
+            let full = temp.path().join(&path);
+            fs::write(&full, "x".repeat(index + 1)).unwrap();
+            let modified = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::new(100 + (index % 11) as u64, (index % 3) as u32);
+            fs::File::open(&full)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            let metadata = fs::metadata(&full).unwrap();
+            expected.push(super::NoteInfo {
+                title: format!("note-{index:03}"),
+                path,
+                modified: chrono::DateTime::<chrono::Utc>::from(metadata.modified().unwrap())
+                    .to_rfc3339(),
+                size: metadata.len(),
+            });
+        }
+        expected.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.path.cmp(&b.path)));
+        for limit in [0, 1, 5, 50, 150, usize::MAX] {
+            let actual = vault.list_notes(None, limit).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected.iter().take(limit).collect::<Vec<_>>()).unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lazy_pages_do_not_visit_later_subtrees_but_reject_symlinks_when_reached() {
+        let (temp, vault) = temp_vault("lazy");
+        fs::write(temp.path().join("a.md"), "match [[Target]] #tag").unwrap();
+        fs::create_dir(temp.path().join("z")).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("a.md"), temp.path().join("z/link.md"))
+            .unwrap();
+        assert_eq!(vault.list_note_paths(None, 1).await.unwrap(), ["a.md"]);
+        assert_eq!(
+            vault
+                .search_notes(None, "match", 1, false, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(vault.get_backlinks("Target", 1, 0).await.unwrap().len(), 1);
+        assert!(matches!(
+            vault.list_note_paths(None, usize::MAX).await,
+            Err(ObsidianError::SymlinkNotAllowed(_))
+        ));
+        assert!(matches!(
+            vault.search_notes(None, "match", 1, false, 1).await,
+            Err(ObsidianError::SymlinkNotAllowed(_))
+        ));
+        assert!(matches!(
+            vault.get_backlinks("Target", 1, 1).await,
+            Err(ObsidianError::SymlinkNotAllowed(_))
+        ));
+        assert!(matches!(
+            vault.list_notes(None, 1).await,
+            Err(ObsidianError::SymlinkNotAllowed(_))
+        ));
+        assert!(matches!(
+            vault.list_tags().await,
+            Err(ObsidianError::SymlinkNotAllowed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn traversal_observes_external_changes_without_stale_results() {
+        let (temp, vault) = temp_vault("fresh");
+        fs::write(temp.path().join("old.md"), "oldtext #old").unwrap();
+        assert_eq!(vault.list_note_paths(None, 10).await.unwrap(), ["old.md"]);
+        assert_eq!(vault.list_tags().await.unwrap()[0].tag, "old");
+        fs::rename(temp.path().join("old.md"), temp.path().join("new.md")).unwrap();
+        fs::write(temp.path().join("new.md"), "newtext #new").unwrap();
+        assert_eq!(vault.list_note_paths(None, 10).await.unwrap(), ["new.md"]);
+        assert!(
+            vault
+                .search_notes(None, "oldtext", 10, false, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            vault
+                .search_notes(None, "newtext", 10, false, 0)
+                .await
+                .unwrap()[0]
+                .path,
+            "new.md"
+        );
+        assert_eq!(vault.list_tags().await.unwrap()[0].tag, "new");
+        fs::remove_file(temp.path().join("new.md")).unwrap();
+        assert!(vault.list_note_paths(None, 10).await.unwrap().is_empty());
+        assert!(vault.list_tags().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelled_discovery_stops_before_advancing_and_stays_finished() {
+        let (temp, vault) = temp_vault("cancelled-discovery");
+        let cancelled = std::sync::Arc::new(super::AtomicBool::new(true));
+        let mut entries = vault.walk_markdown_files(
+            &temp.path().join("missing"),
+            &cancelled,
+            super::TraversalOrder::Lexical,
+        );
+        assert!(
+            matches!(entries.next(), Some(Err(ObsidianError::Io(error))) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        assert!(entries.next().is_none());
+        assert!(entries.next().is_none());
+    }
+
+    #[test]
+    fn tag_batches_finish_with_one_blocking_thread_and_at_batch_boundaries() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for count in [0, 1, 31, 32, 33, 63, 64, 65, 100] {
+                let (temp, vault) = temp_vault("single-worker");
+                for index in 0..count {
+                    fs::write(temp.path().join(format!("{index}.md")), "#rust #Rust").unwrap();
+                }
+                let tags =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), vault.list_tags())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if count == 0 {
+                    assert!(tags.is_empty());
+                } else {
+                    assert_eq!(tags.len(), 1);
+                    assert_eq!(tags[0].count, count);
+                }
+            }
+        });
     }
 
     #[test]

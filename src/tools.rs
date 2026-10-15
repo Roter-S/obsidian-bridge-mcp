@@ -236,7 +236,7 @@ impl ObsidianService {
     }
 
     #[tool(
-        description = "Browse markdown paths recursively, no query needed. Use for folder discovery, not search_notes with an empty query. Compact paths by default; follow next_offset while has_more. Stable path order (details=true: newest first).",
+        description = "Browse markdown paths recursively, no query needed. Use for folder discovery, not search_notes with an empty query. Compact paths by default; stops after the requested page. Follow next_offset while has_more. Stable path order (details=true: scans all note metadata, newest first).",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

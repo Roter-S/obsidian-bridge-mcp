@@ -286,6 +286,50 @@ async fn reads_are_paged_by_default_and_extreme_offsets_do_not_overflow() {
     assert_eq!(end["has_more"], false);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn partial_pages_stop_before_unvisited_subtrees_and_surface_later_errors() {
+    let mut c = Client::start(false).await;
+    for path in ["a.md", "b.md"] {
+        c.note(path, "match [[Target]]");
+    }
+    let root = c._vault.path().join("BYTE");
+    std::fs::create_dir(root.join("z")).unwrap();
+    std::os::unix::fs::symlink(root.join("a.md"), root.join("z/link.md")).unwrap();
+    let first = c.data("list_notes", json!({"limit":1})).await;
+    assert_eq!(first["notes"], json!(["a.md"]));
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["next_offset"], 1);
+    for (tool, arguments) in [
+        ("list_notes", json!({"limit":1,"offset":1})),
+        ("list_notes", json!({"limit":1,"details":true})),
+        ("list_tags", json!({})),
+    ] {
+        let error = c.call(tool, arguments).await;
+        assert!(error.get("error").is_some(), "{error}");
+        assert!(
+            error.to_string().contains("symlinks are not allowed"),
+            "{error}"
+        );
+    }
+    for (tool, arguments) in [
+        ("search_notes", json!({"query":"match","limit":1})),
+        ("get_backlinks", json!({"path":"Target","limit":1})),
+    ] {
+        let first = c.data(tool, arguments.clone()).await;
+        assert_eq!(first["count"], 1);
+        assert_eq!(first["has_more"], true);
+        let mut next = arguments;
+        next["offset"] = json!(1);
+        let error = c.call(tool, next).await;
+        assert!(error.get("error").is_some(), "{error}");
+        assert!(
+            error.to_string().contains("symlinks are not allowed"),
+            "{error}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn unsafe_paths_are_rejected_over_the_wire() {
     let mut c = Client::start(false).await;
