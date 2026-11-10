@@ -119,4 +119,23 @@ Starting with v0.3.0:
 - Read failures in searches, backlinks, and tag scans are reported instead of
   silently returning incomplete successful results.
 
+Starting with v0.4.0:
+
+- Every tool result is one block of JSON text. Results no longer include a
+  duplicate `structuredContent` copy, and tools no longer publish an output schema.
+- Failed calls are tool results marked `isError` with a corrective message, not
+  JSON-RPC errors. Arguments a tool does not define are rejected.
+- `search_notes` groups matching lines under each note (`matches[].lines[]`) and
+  ignores accents as well as case. `limit`, `offset`, and `count` still count lines.
+- `list_notes` with `details: true` returns `details` without the `notes` list;
+  entries no longer have `title`, and `modified` is a UTC time in whole seconds.
+- Results no longer repeat the requested `path` or `target`.
+- Folders whose names start with a dot, including `.trash`, are skipped unless
+  named as `folder`.
+- `append_note` starts the appended content on a new line.
+- `get_backlinks` for an explicit path includes links from other notes that share
+  its file name.
+- New tools: `delete_note` (moves to `.trash`) and `move_note`. `list_notes`
+  accepts `tag`; `update_note` accepts `expected_total_lines`.
+
 See the [usage guide](usage.md) for examples and troubleshooting.

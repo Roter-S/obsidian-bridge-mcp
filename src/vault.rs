@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use unicode_normalization::char::{decompose_canonical, is_combining_mark};
 use walkdir::WalkDir;
 
 use crate::cli::VaultSpec;
@@ -39,17 +40,16 @@ pub struct VaultInfo {
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct NoteInfo {
     pub path: String,
-    pub title: String,
     pub modified: String,
     #[schemars(with = "i64")]
     pub size: u64,
 }
 
-// A max-heap keeps the worst retained candidate on top: oldest modified string,
-// then greatest path. Match the existing response ordering, including tie breaks.
+// A max-heap keeps the worst retained candidate on top: oldest modification
+// time at full precision, then greatest path. Responses only print seconds.
 #[derive(Eq, PartialEq, Ord, PartialOrd)]
 struct NoteCandidate {
-    modified: Reverse<String>,
+    modified: Reverse<DateTime<Utc>>,
     path: String,
     size: u64,
 }
@@ -123,7 +123,18 @@ impl VaultRegistry {
     pub fn get(&self, name: &str) -> Result<&Vault, ObsidianError> {
         self.vaults
             .get(name)
-            .ok_or_else(|| ObsidianError::UnknownVault(name.to_string()))
+            .ok_or_else(|| ObsidianError::UnknownVault {
+                name: name.to_string(),
+                available: self.names(),
+            })
+    }
+
+    fn names(&self) -> String {
+        self.list()
+            .into_iter()
+            .map(|vault| vault.name)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     pub fn get_or_default(&self, name: Option<&str>) -> Result<&Vault, ObsidianError> {
@@ -135,13 +146,7 @@ impl VaultRegistry {
                 } else if self.vaults.is_empty() {
                     Err(ObsidianError::NoVaultsConfigured)
                 } else {
-                    let available = self
-                        .list()
-                        .into_iter()
-                        .map(|v| v.name)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    Err(ObsidianError::AmbiguousVault(available))
+                    Err(ObsidianError::AmbiguousVault(self.names()))
                 }
             }
         }
@@ -178,10 +183,12 @@ impl Vault {
         &self,
         folder: Option<&str>,
         limit: usize,
+        tag: Option<&str>,
     ) -> Result<Vec<NoteInfo>, ObsidianError> {
         let folder = folder.map(str::to_owned);
+        let tag = tag.map(normalize_tag).transpose()?;
         self.blocking(move |vault, cancelled| {
-            vault.list_notes_blocking(folder.as_deref(), limit, cancelled)
+            vault.list_notes_blocking(folder.as_deref(), limit, tag.as_deref(), cancelled)
         })
         .await
     }
@@ -190,6 +197,7 @@ impl Vault {
         &self,
         folder: Option<&str>,
         limit: usize,
+        tag: Option<&str>,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<Vec<NoteInfo>, ObsidianError> {
         let base = self.resolve_folder_path(folder)?;
@@ -199,12 +207,17 @@ impl Vault {
         // `limit` candidates. Do not allocate capacity from an untrusted limit.
         for entry in self.walk_markdown_files(&base, cancelled, TraversalOrder::Unordered) {
             let entry = entry?;
+            if let Some(tag) = tag
+                && !note_has_tag(entry.path(), tag, cancelled)?
+            {
+                continue;
+            }
             let metadata = entry
                 .metadata()
                 .map_err(|error| ObsidianError::Io(std::io::Error::other(error)))?;
             let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let candidate = NoteCandidate {
-                modified: Reverse(DateTime::<Utc>::from(modified).to_rfc3339()),
+                modified: Reverse(DateTime::<Utc>::from(modified)),
                 path: self.relative_string(entry.path())?,
                 size: metadata.len(),
             };
@@ -221,13 +234,8 @@ impl Vault {
             .into_sorted_vec()
             .into_iter()
             .map(|note| NoteInfo {
-                title: Path::new(&note.path)
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or_default()
-                    .to_owned(),
                 path: note.path,
-                modified: note.modified.0,
+                modified: note.modified.0.to_rfc3339_opts(SecondsFormat::Secs, true),
                 size: note.size,
             })
             .collect())
@@ -237,10 +245,12 @@ impl Vault {
         &self,
         folder: Option<&str>,
         limit: usize,
+        tag: Option<&str>,
     ) -> Result<Vec<String>, ObsidianError> {
         let folder = folder.map(str::to_owned);
+        let tag = tag.map(normalize_tag).transpose()?;
         self.blocking(move |vault, cancelled| {
-            vault.list_note_paths_blocking(folder.as_deref(), limit, cancelled)
+            vault.list_note_paths_blocking(folder.as_deref(), limit, tag.as_deref(), cancelled)
         })
         .await
     }
@@ -249,16 +259,23 @@ impl Vault {
         &self,
         folder: Option<&str>,
         limit: usize,
+        tag: Option<&str>,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<Vec<String>, ObsidianError> {
         let base = self.resolve_folder_path(folder)?;
         let mut paths = Vec::new();
+        let mut entries = self.walk_markdown_files(&base, cancelled, TraversalOrder::Lexical);
 
-        for entry in self
-            .walk_markdown_files(&base, cancelled, TraversalOrder::Lexical)
-            .take(limit)
-        {
-            paths.push(self.relative_string(entry?.path())?);
+        // Stop before advancing past a full page: later subtrees stay unvisited.
+        while paths.len() < limit {
+            let Some(entry) = entries.next() else { break };
+            let entry = entry?;
+            if let Some(tag) = tag
+                && !note_has_tag(entry.path(), tag, cancelled)?
+            {
+                continue;
+            }
+            paths.push(self.relative_string(entry.path())?);
         }
         Ok(paths)
     }
@@ -377,15 +394,16 @@ impl Vault {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let needle = query.to_lowercase();
+        let needle = fold_for_search(query);
         let mut matches = Vec::new();
         let mut skipped = 0;
+        let mut scratch = String::new();
 
         for entry in self.walk_markdown_files(&base, cancelled, TraversalOrder::Components) {
             let entry = entry?;
             let rel = self.relative_string(entry.path())?;
             if path_only {
-                if contains_ignore_case(&rel, &needle) {
+                if contains_folded(&rel, &needle, &mut scratch) {
                     if skipped < offset {
                         skipped += 1;
                         continue;
@@ -398,7 +416,7 @@ impl Vault {
                 }
             } else {
                 scan_note_lines(entry.path(), cancelled, |line_number, line| {
-                    if contains_ignore_case(line, &needle) {
+                    if contains_folded(line, &needle, &mut scratch) {
                         if skipped < offset {
                             skipped += 1;
                             return true;
@@ -431,18 +449,60 @@ impl Vault {
         Ok(())
     }
 
+    /// Appended content starts on its own line: a note that does not end in a
+    /// newline gets one first, unless the content already begins with one.
     pub async fn append_note(&self, path: &str, content: &str) -> Result<(), ObsidianError> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
         let path = self.resolve_note_path(path, true)?;
-        let mut file = fs::OpenOptions::new().append(true).open(path).await?;
-        file.write_all(content.as_bytes()).await?;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .await?;
+        let mut separator = "";
+        if !content.starts_with(['\n', '\r']) && file.metadata().await?.len() > 0 {
+            let mut last = [0u8; 1];
+            file.seek(std::io::SeekFrom::End(-1)).await?;
+            file.read_exact(&mut last).await?;
+            if last[0] != b'\n' {
+                separator = "\n";
+            }
+        }
+        // One write keeps the separator and content together in append mode.
+        file.write_all([separator, content].concat().as_bytes())
+            .await?;
         file.sync_all().await?;
         Ok(())
     }
 
-    pub async fn update_note(&self, path: &str, content: &str) -> Result<(), ObsidianError> {
-        let path = self.resolve_note_path(path, true)?;
-        self.atomic_write(&path, content, true).await?;
-        Ok(())
+    /// Returns the line counts before and after the replacement. A stale
+    /// `expected_total_lines` rejects the write before anything changes.
+    pub async fn update_note(
+        &self,
+        path: &str,
+        content: &str,
+        expected_total_lines: Option<usize>,
+    ) -> Result<(usize, usize), ObsidianError> {
+        let full_path = self.resolve_note_path(path, true)?;
+        let previous = fs::read(&full_path)
+            .await
+            .map_err(|source| ObsidianError::ReadNote {
+                path: full_path.clone(),
+                source,
+            })?;
+        let previous_lines = count_lines(&previous);
+        if let Some(expected) = expected_total_lines
+            && expected != previous_lines
+        {
+            return Err(ObsidianError::LineCountMismatch {
+                path: path.to_string(),
+                expected,
+                actual: previous_lines,
+            });
+        }
+        self.atomic_write(&full_path, content, true).await?;
+        Ok((previous_lines, count_lines(content.as_bytes())))
     }
 
     pub async fn patch_note(
@@ -464,22 +524,96 @@ impl Vault {
                     source,
                 })?;
 
-        let matches = content.matches(old_text).count();
-        if matches == 0 {
-            return Err(ObsidianError::TextNotFoundInNote {
-                path: path.to_string(),
-            });
-        }
-        if matches > 1 {
-            return Err(ObsidianError::AmbiguousPatchText {
-                path: path.to_string(),
-                occurrences: matches,
-            });
+        // read_note reports lines joined by "\n". A note stored with CRLF line
+        // endings must still accept a snippet copied from that output.
+        let (mut old_text, mut new_text) = (old_text.to_owned(), new_text.to_owned());
+        if !content.contains(&old_text) && content.contains("\r\n") && !old_text.contains('\r') {
+            old_text = old_text.replace('\n', "\r\n");
+            new_text = new_text.replace("\r\n", "\n").replace('\n', "\r\n");
         }
 
-        let patched_content = content.replacen(old_text, new_text, 1);
-        self.atomic_write(&full_path, &patched_content, true)
-            .await?;
+        let starts: Vec<_> = content
+            .match_indices(&old_text)
+            .map(|(index, _)| index)
+            .collect();
+        match starts.as_slice() {
+            [] => Err(ObsidianError::TextNotFoundInNote {
+                path: path.to_string(),
+            }),
+            [_] => {
+                let patched_content = content.replacen(&old_text, &new_text, 1);
+                self.atomic_write(&full_path, &patched_content, true).await
+            }
+            _ => Err(ObsidianError::AmbiguousPatchText {
+                path: path.to_string(),
+                occurrences: starts.len(),
+                lines: starts
+                    .iter()
+                    .take(5)
+                    .map(|&index| (content[..index].matches('\n').count() + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
+        }
+    }
+
+    /// Moves a note into the vault's `.trash/` folder, as Obsidian does, and
+    /// returns its new vault-relative path. Never overwrites a trashed note.
+    pub async fn delete_note(&self, path: &str) -> Result<String, ObsidianError> {
+        let source = self.resolve_note_path(path, true)?;
+        let trash = self.checked_join(Path::new(TRASH_DIR))?;
+        if source.starts_with(&trash) {
+            return Err(ObsidianError::AlreadyInTrash(path.to_string()));
+        }
+        fs::create_dir_all(&trash).await?;
+        let stem = source
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or("note")
+            .to_owned();
+        for attempt in 1..=10_000 {
+            let name = if attempt == 1 {
+                format!("{stem}.md")
+            } else {
+                format!("{stem} {attempt}.md")
+            };
+            let destination = trash.join(name);
+            match self.move_no_replace(&source, &destination).await {
+                Ok(()) => return self.relative_string(&destination),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(ObsidianError::Io(error)),
+            }
+        }
+        Err(ObsidianError::NoteAlreadyExists(format!(
+            "{TRASH_DIR}/{stem}.md"
+        )))
+    }
+
+    /// Moves or renames a note. Fails if the destination exists. Links in
+    /// other notes are not rewritten.
+    pub async fn move_note(&self, path: &str, new_path: &str) -> Result<(), ObsidianError> {
+        let source = self.resolve_note_path(path, true)?;
+        let destination = self.resolve_note_path(new_path, false)?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        match self.move_no_replace(&source, &destination).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(ObsidianError::NoteAlreadyExists(new_path.to_string()))
+            }
+            Err(error) => Err(ObsidianError::Io(error)),
+        }
+    }
+
+    // Publishing a hard link is atomic and fails if the destination exists; a
+    // plain rename would silently replace it. The note keeps its timestamps.
+    async fn move_no_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        fs::hard_link(source, destination).await?;
+        if let Err(error) = fs::remove_file(source).await {
+            let _ = fs::remove_file(destination).await;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -509,6 +643,9 @@ impl Vault {
         }
 
         let target_path = Path::new(target);
+        // A bare title can name any note with that basename; an explicit path
+        // names one note, so same-named notes elsewhere are still sources.
+        let target_is_path = target.ends_with(".md") || target.contains('/');
         let stem = target_path
             .file_stem()
             .and_then(OsStr::to_str)
@@ -534,7 +671,7 @@ impl Vault {
                 .and_then(OsStr::to_str)
                 .unwrap_or("")
                 .to_lowercase();
-            if rel_stem == stem || rel_norm == target_norm {
+            if rel_norm == target_norm || (!target_is_path && rel_stem == stem) {
                 continue;
             }
             scan_note_lines(entry.path(), cancelled, |line_number, line| {
@@ -648,7 +785,16 @@ impl Vault {
                 .open(&temp_path)
                 .await?;
             file.write_all(content.as_bytes()).await?;
-            file.sync_all().await?;
+            if overwrite && let Ok(original) = fs::metadata(path).await {
+                // The replacement is a new file. Carry over what Obsidian and
+                // the user can observe: permissions and the creation date.
+                file.set_permissions(original.permissions()).await?;
+                let file = file.into_std().await;
+                keep_creation_time(&file, &original);
+                file.sync_all()?;
+            } else {
+                file.sync_all().await?;
+            }
             Ok::<(), std::io::Error>(())
         }
         .await;
@@ -781,7 +927,7 @@ impl Vault {
         };
         let mut entries = walker
             .into_iter()
-            .filter_entry(|entry| !is_ignored_dir(entry.path()));
+            .filter_entry(|entry| !is_hidden_dir(entry));
         let mut finished = false;
         std::iter::from_fn(move || {
             if finished {
@@ -886,19 +1032,98 @@ fn compact_excerpt(text: &str) -> String {
     result
 }
 
-fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
+/// Case- and accent-insensitive search key: decompose, drop combining marks,
+/// lowercase. Precomposed and decomposed spellings (macOS file names) agree.
+fn fold_for_search(text: &str) -> String {
+    let mut folded = String::new();
+    fold_into(text, &mut folded);
+    folded
+}
+
+// Dropping every combining mark makes their order irrelevant, so characters
+// are decomposed one at a time instead of through a reordering NFD iterator.
+fn fold_into(text: &str, folded: &mut String) {
+    folded.clear();
+    for c in text.chars() {
+        if c.is_ascii() {
+            folded.push(c.to_ascii_lowercase());
+        } else {
+            decompose_canonical(c, |part| {
+                if !is_combining_mark(part) {
+                    folded.extend(part.to_lowercase());
+                }
+            });
+        }
+    }
+}
+
+// `scratch` is reused across lines so a scan does not allocate per line.
+fn contains_folded(haystack: &str, needle_folded: &str, scratch: &mut String) -> bool {
+    if needle_folded.is_empty() {
         return true;
     }
-    if haystack.is_ascii() && needle_lower.is_ascii() {
-        let n = needle_lower.as_bytes();
-        haystack
+    if !haystack.is_ascii() {
+        fold_into(haystack, scratch);
+        return scratch.contains(needle_folded);
+    }
+    // Folding ASCII only changes case, so compare bytes without allocating.
+    let n = needle_folded.as_bytes();
+    needle_folded.is_ascii()
+        && haystack
             .as_bytes()
             .windows(n.len())
             .any(|w| w.eq_ignore_ascii_case(n))
-    } else {
-        haystack.to_lowercase().contains(needle_lower)
+}
+
+fn count_lines(bytes: &[u8]) -> usize {
+    let newlines = bytes.iter().filter(|&&byte| byte == b'\n').count();
+    newlines + usize::from(bytes.last().is_some_and(|&byte| byte != b'\n'))
+}
+
+// Only macOS and Windows let a process set a file's creation time.
+#[allow(unused_variables)]
+fn keep_creation_time(file: &std::fs::File, original: &std::fs::Metadata) {
+    #[cfg(any(target_vendor = "apple", windows))]
+    {
+        #[cfg(target_vendor = "apple")]
+        use std::os::darwin::fs::FileTimesExt;
+        #[cfg(windows)]
+        use std::os::windows::fs::FileTimesExt;
+
+        // Best effort: a filesystem without creation times must not fail a write.
+        if let Ok(created) = original.created() {
+            let _ = file.set_times(std::fs::FileTimes::new().set_created(created));
+        }
     }
+}
+
+fn normalize_tag(tag: &str) -> Result<String, ObsidianError> {
+    let tag = tag.trim().trim_start_matches('#').trim_matches('/');
+    if tag.is_empty() {
+        return Err(ObsidianError::EmptyTag);
+    }
+    Ok(tag.to_lowercase())
+}
+
+// Matches the tag itself and nested tags below it, as Obsidian does. Stops
+// reading the note at the first matching tag.
+fn note_has_tag(path: &Path, tag: &str, cancelled: &AtomicBool) -> Result<bool, ObsidianError> {
+    let mut parser = TagParser::default();
+    let mut seen = 0;
+    let mut found = false;
+    scan_note_lines(path, cancelled, |_, line| {
+        parser.push_line(line);
+        if parser.tags.len() != seen {
+            seen = parser.tags.len();
+            found = parser.tags.iter().any(|candidate| {
+                candidate
+                    .strip_prefix(tag)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            });
+        }
+        !found
+    })?;
+    Ok(found)
 }
 
 fn line_contains_wikilink_to(line: &str, target_stem_lower: &str, target_norm_lower: &str) -> bool {
@@ -996,11 +1221,13 @@ impl TagParser {
 
         // Find ASCII delimiters by byte; decode Unicode only around actual tags.
         for (index, _) in line.match_indices('#') {
-            let prev_ok = line[..index]
+            let before = &line[..index];
+            let prev_ok = before
                 .chars()
                 .next_back()
                 .is_none_or(|c| c.is_whitespace() || c == '(' || c == '[');
-            if !prev_ok {
+            // `[text](#heading)` is a link to a heading, not a tag.
+            if !prev_ok || before.ends_with("](") {
                 continue;
             }
             let rest = &line[index + 1..];
@@ -1090,8 +1317,14 @@ fn is_markdown(path: &Path) -> bool {
     path.extension() == Some(OsStr::new("md"))
 }
 
-fn is_ignored_dir(path: &Path) -> bool {
-    path.file_name() == Some(OsStr::new(".obsidian"))
+const TRASH_DIR: &str = ".trash";
+
+// Obsidian hides dot-folders: `.obsidian`, `.trash` (deleted notes), `.git`.
+// The folder a caller names explicitly (depth 0) is still traversed.
+fn is_hidden_dir(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() > 0
+        && entry.file_type().is_dir()
+        && entry.file_name().as_encoded_bytes().starts_with(b".")
 }
 
 #[cfg(test)]
@@ -1134,7 +1367,7 @@ mod tests {
         );
 
         vault
-            .update_note("Projects/demo.md", "# Updated")
+            .update_note("Projects/demo.md", "# Updated", None)
             .await
             .expect("update note");
         assert_eq!(
@@ -1531,7 +1764,7 @@ mod tests {
         assert_ne!(lexical, components); // Exercise the subtle a.md / a/ ordering.
         for limit in [0, 1, 5, paths.len(), paths.len() + 1, usize::MAX] {
             assert_eq!(
-                vault.list_note_paths(None, limit).await.unwrap(),
+                vault.list_note_paths(None, limit, None).await.unwrap(),
                 lexical.iter().take(limit).cloned().collect::<Vec<_>>()
             );
             for offset in [0, 1, 5, paths.len(), usize::MAX] {
@@ -1563,7 +1796,7 @@ mod tests {
             }
         }
         let nested = vault
-            .list_note_paths(Some("nested"), usize::MAX)
+            .list_note_paths(Some("nested"), usize::MAX, None)
             .await
             .unwrap();
         assert_eq!(nested, ["nested/a.md", "nested/a/child.md", "nested/a0.md"]);
@@ -1584,17 +1817,19 @@ mod tests {
                 .set_times(std::fs::FileTimes::new().set_modified(modified))
                 .unwrap();
             let metadata = fs::metadata(&full).unwrap();
-            expected.push(super::NoteInfo {
-                title: format!("note-{index:03}"),
+            let time = chrono::DateTime::<chrono::Utc>::from(metadata.modified().unwrap());
+            let info = super::NoteInfo {
                 path,
-                modified: chrono::DateTime::<chrono::Utc>::from(metadata.modified().unwrap())
-                    .to_rfc3339(),
+                modified: time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 size: metadata.len(),
-            });
+            };
+            expected.push((time, info));
         }
-        expected.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.path.cmp(&b.path)));
+        // Ties within a printed second are still ordered by the full timestamp.
+        expected.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.path.cmp(&b.1.path)));
+        let expected: Vec<_> = expected.into_iter().map(|(_, info)| info).collect();
         for limit in [0, 1, 5, 50, 150, usize::MAX] {
-            let actual = vault.list_notes(None, limit).await.unwrap();
+            let actual = vault.list_notes(None, limit, None).await.unwrap();
             assert_eq!(
                 serde_json::to_value(actual).unwrap(),
                 serde_json::to_value(expected.iter().take(limit).collect::<Vec<_>>()).unwrap()
@@ -1610,7 +1845,10 @@ mod tests {
         fs::create_dir(temp.path().join("z")).unwrap();
         std::os::unix::fs::symlink(temp.path().join("a.md"), temp.path().join("z/link.md"))
             .unwrap();
-        assert_eq!(vault.list_note_paths(None, 1).await.unwrap(), ["a.md"]);
+        assert_eq!(
+            vault.list_note_paths(None, 1, None).await.unwrap(),
+            ["a.md"]
+        );
         assert_eq!(
             vault
                 .search_notes(None, "match", 1, false, 0)
@@ -1621,7 +1859,7 @@ mod tests {
         );
         assert_eq!(vault.get_backlinks("Target", 1, 0).await.unwrap().len(), 1);
         assert!(matches!(
-            vault.list_note_paths(None, usize::MAX).await,
+            vault.list_note_paths(None, usize::MAX, None).await,
             Err(ObsidianError::SymlinkNotAllowed(_))
         ));
         assert!(matches!(
@@ -1633,7 +1871,7 @@ mod tests {
             Err(ObsidianError::SymlinkNotAllowed(_))
         ));
         assert!(matches!(
-            vault.list_notes(None, 1).await,
+            vault.list_notes(None, 1, None).await,
             Err(ObsidianError::SymlinkNotAllowed(_))
         ));
         assert!(matches!(
@@ -1646,11 +1884,17 @@ mod tests {
     async fn traversal_observes_external_changes_without_stale_results() {
         let (temp, vault) = temp_vault("fresh");
         fs::write(temp.path().join("old.md"), "oldtext #old").unwrap();
-        assert_eq!(vault.list_note_paths(None, 10).await.unwrap(), ["old.md"]);
+        assert_eq!(
+            vault.list_note_paths(None, 10, None).await.unwrap(),
+            ["old.md"]
+        );
         assert_eq!(vault.list_tags().await.unwrap()[0].tag, "old");
         fs::rename(temp.path().join("old.md"), temp.path().join("new.md")).unwrap();
         fs::write(temp.path().join("new.md"), "newtext #new").unwrap();
-        assert_eq!(vault.list_note_paths(None, 10).await.unwrap(), ["new.md"]);
+        assert_eq!(
+            vault.list_note_paths(None, 10, None).await.unwrap(),
+            ["new.md"]
+        );
         assert!(
             vault
                 .search_notes(None, "oldtext", 10, false, 0)
@@ -1668,7 +1912,13 @@ mod tests {
         );
         assert_eq!(vault.list_tags().await.unwrap()[0].tag, "new");
         fs::remove_file(temp.path().join("new.md")).unwrap();
-        assert!(vault.list_note_paths(None, 10).await.unwrap().is_empty());
+        assert!(
+            vault
+                .list_note_paths(None, 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(vault.list_tags().await.unwrap().is_empty());
     }
 
@@ -1759,6 +2009,244 @@ mod tests {
     fn rejects_non_markdown_notes() {
         let error = normalize_relative_path("Projects/demo.txt", true).expect_err("must reject");
         assert!(matches!(error, ObsidianError::NonMarkdownPath(_)));
+    }
+
+    #[tokio::test]
+    async fn patch_accepts_lf_snippets_for_crlf_notes_and_locates_ambiguity() {
+        let (temp, vault) = temp_vault("crlf");
+        let path = temp.path().join("crlf.md");
+        fs::write(&path, "uno\r\ndos\r\ntres\r\nuno").unwrap();
+        // read_note reports "\n" between lines; that snippet must still patch.
+        vault
+            .patch_note("crlf.md", "uno\ndos", "one\ntwo")
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "one\r\ntwo\r\ntres\r\nuno"
+        );
+        fs::write(&path, "x\r\nsame\r\ny\r\nsame").unwrap();
+        let error = vault.patch_note("crlf.md", "same", "z").await.unwrap_err();
+        assert!(error.to_string().contains("lines 2, 4"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "x\r\nsame\r\ny\r\nsame");
+    }
+
+    #[tokio::test]
+    async fn append_starts_on_a_new_line_without_doubling_newlines() {
+        let (temp, vault) = temp_vault("append");
+        let path = temp.path().join("a.md");
+        for (existing, added, expected) in [
+            ("tres", "cuatro", "tres\ncuatro"),
+            ("tres\n", "cuatro", "tres\ncuatro"),
+            ("tres", "\ncuatro", "tres\ncuatro"),
+            ("", "cuatro", "cuatro"),
+            ("tres", "", "tres\n"),
+        ] {
+            fs::write(&path, existing).unwrap();
+            vault.append_note("a.md", added).await.unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn hidden_folders_are_skipped_unless_named() {
+        let (temp, vault) = temp_vault("hidden");
+        for path in ["live.md", ".trash/old.md", ".git/x.md", "ok/.cache/y.md"] {
+            let full = temp.path().join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, "needle [[Target]] #tag").unwrap();
+        }
+        assert_eq!(
+            vault.list_note_paths(None, 10, None).await.unwrap(),
+            ["live.md"]
+        );
+        assert_eq!(vault.list_notes(None, 10, None).await.unwrap().len(), 1);
+        let found = vault
+            .search_notes(None, "needle", 10, false, 0)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(vault.get_backlinks("Target", 10, 0).await.unwrap().len(), 1);
+        assert_eq!(vault.list_tags().await.unwrap()[0].count, 1);
+        // Naming the trash explicitly is how a deleted note is found again.
+        assert_eq!(
+            vault
+                .list_note_paths(Some(".trash"), 10, None)
+                .await
+                .unwrap(),
+            [".trash/old.md"]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_ignores_case_and_accents_in_content_and_paths() {
+        let (temp, vault) = temp_vault("accents");
+        // Precomposed in the body; decomposed (as macOS may store it) in the name.
+        fs::write(
+            temp.path().join("cancio\u{301}n.md"),
+            "Mi canción vieja\nÑandú",
+        )
+        .unwrap();
+        for query in ["cancion", "CANCIÓN", "cancio\u{301}n"] {
+            for path_only in [false, true] {
+                let found = vault
+                    .search_notes(None, query, 10, path_only, 0)
+                    .await
+                    .unwrap();
+                assert_eq!(found.len(), 1, "{query} path_only={path_only}");
+            }
+        }
+        for (query, hits) in [("nandu", 1), ("vieja", 1), ("viejo", 0), ("日本", 0)] {
+            let found = vault.search_notes(None, query, 10, false, 0).await.unwrap();
+            assert_eq!(found.len(), hits, "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_trashes_without_overwriting_and_move_never_replaces() {
+        let (temp, vault) = temp_vault("trash");
+        for path in ["a/note.md", "b/note.md"] {
+            vault.create_note(path, path).await.unwrap();
+        }
+        assert_eq!(
+            vault.delete_note("a/note.md").await.unwrap(),
+            ".trash/note.md"
+        );
+        assert_eq!(
+            vault.delete_note("b/note.md").await.unwrap(),
+            ".trash/note 2.md"
+        );
+        assert!(!temp.path().join("a/note.md").exists());
+        assert_eq!(
+            vault.read_note(".trash/note.md").await.unwrap(),
+            "a/note.md"
+        );
+        assert_eq!(
+            vault.read_note(".trash/note 2.md").await.unwrap(),
+            "b/note.md"
+        );
+        assert!(matches!(
+            vault.delete_note(".trash/note.md").await,
+            Err(ObsidianError::AlreadyInTrash(_))
+        ));
+        assert!(matches!(
+            vault.delete_note("a/note.md").await,
+            Err(ObsidianError::NoteNotFound(_))
+        ));
+
+        assert!(matches!(
+            vault.move_note(".trash/note.md", ".trash/note 2.md").await,
+            Err(ObsidianError::NoteAlreadyExists(_))
+        ));
+        assert_eq!(
+            vault.read_note(".trash/note.md").await.unwrap(),
+            "a/note.md"
+        );
+        vault
+            .move_note(".trash/note.md", "new/deep/renamed.md")
+            .await
+            .unwrap();
+        assert_eq!(
+            vault.read_note("new/deep/renamed.md").await.unwrap(),
+            "a/note.md"
+        );
+        for (from, to) in [("new/deep/renamed.md", "x.txt"), ("../x.md", "y.md")] {
+            assert!(vault.move_note(from, to).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn backlinks_from_a_same_named_note_count_for_an_explicit_path() {
+        let (_temp, vault) = temp_vault("same-name");
+        vault.create_note("a/Target.md", "# Target").await.unwrap();
+        vault
+            .create_note("b/Target.md", "see [[a/Target]]")
+            .await
+            .unwrap();
+        let sources = vault.get_backlinks("a/Target.md", 10, 0).await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_path, "b/Target.md");
+        // A bare title cannot tell the two notes apart, so neither is a source.
+        assert!(
+            vault
+                .get_backlinks("Target", 10, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn notes_can_be_listed_by_inline_frontmatter_and_nested_tags() {
+        let (_temp, vault) = temp_vault("tags");
+        for (path, content) in [
+            ("front.md", "---\ntags: [Dev, x]\n---\nbody"),
+            ("inline.md", "text #dev/backend"),
+            ("link.md", "a [heading](#dev) link and #developer"),
+            ("none.md", "nothing"),
+        ] {
+            vault.create_note(path, content).await.unwrap();
+        }
+        for tag in ["dev", "#Dev", " dev/ "] {
+            assert_eq!(
+                vault.list_note_paths(None, 10, Some(tag)).await.unwrap(),
+                ["front.md", "inline.md"],
+                "{tag}"
+            );
+        }
+        let detailed = vault
+            .list_notes(None, 10, Some("dev/backend"))
+            .await
+            .unwrap();
+        assert_eq!(detailed.len(), 1);
+        assert_eq!(detailed[0].path, "inline.md");
+        // A page stops reading at its limit, like an unfiltered listing.
+        assert_eq!(
+            vault.list_note_paths(None, 1, Some("dev")).await.unwrap(),
+            ["front.md"]
+        );
+        assert!(matches!(
+            vault.list_note_paths(None, 10, Some(" # ")).await,
+            Err(ObsidianError::EmptyTag)
+        ));
+        let tags = vault.list_tags().await.unwrap();
+        assert!(tags.iter().any(|tag| tag.tag == "developer"));
+        assert_eq!(tags.iter().find(|tag| tag.tag == "dev").unwrap().count, 1);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_a_stale_line_count_before_writing() {
+        let (_temp, vault) = temp_vault("guard");
+        vault.create_note("a.md", "1\n2\n3\n").await.unwrap();
+        assert!(matches!(
+            vault.update_note("a.md", "x", Some(2)).await,
+            Err(ObsidianError::LineCountMismatch {
+                expected: 2,
+                actual: 3,
+                ..
+            })
+        ));
+        assert_eq!(vault.read_note("a.md").await.unwrap(), "1\n2\n3\n");
+        assert_eq!(
+            vault.update_note("a.md", "x\ny", Some(3)).await.unwrap(),
+            (3, 2)
+        );
+        assert_eq!(vault.update_note("a.md", "", None).await.unwrap(), (2, 0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn rewrites_keep_the_creation_date() {
+        let (temp, vault) = temp_vault("created");
+        vault.create_note("a.md", "one").await.unwrap();
+        let path = temp.path().join("a.md");
+        let created = fs::metadata(&path).unwrap().created().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        vault.patch_note("a.md", "one", "two").await.unwrap();
+        vault.update_note("a.md", "three", None).await.unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.created().unwrap(), created);
+        assert!(metadata.modified().unwrap() > created);
     }
 
     #[test]

@@ -40,14 +40,17 @@
 
 - `vault` is optional only when exactly one vault is configured. With multiple vaults, require an exact name; never choose a vault arbitrarily, especially for writes.
 - Note paths are vault-relative and must end in `.md`. Reject absolute paths, `..`, `.obsidian`, and symlinks. Omit optional `folder` to select the vault root.
+- Every tool result is exactly one JSON text block: no `structuredContent` copy and no output schema. Vault and note failures are tool results with `isError: true` and a message that says how to correct the call, never JSON-RPC errors. Parameter structs reject unknown fields.
+- Traversal skips folders whose names start with a dot (`.obsidian`, `.trash`, `.git`) below the selected folder; a dot-folder named explicitly as `folder` is traversed.
 - Use `list_notes` for browsing without a query. `search_notes` requires non-empty literal text after trimming; reject it with an actionable query error, not `EmptyPath`.
-- `path_only` search must not read note bodies or return a duplicate path as an excerpt.
+- `path_only` search must not read note bodies; its matches contain only `path`. Content matches are grouped per note (`matches[].lines[]`) while `limit`, `offset`, and `count` count matching lines. Search ignores case and accents (NFD, combining marks dropped); keep the allocation-free ASCII path.
+- `list_notes` returns `notes` (compact) or `details` (`path`, `modified` in UTC seconds, `size`), never both. Detailed ordering uses the full-precision modification time. `tag` matches inline and frontmatter tags, including nested tags.
 - Default / maximum limits: `list_notes` 100/500; `search_notes` 20/200; `get_backlinks` 50/200; `list_tags` 100/500; `read_note` 200/500 lines. MCP limits clamp to at least 1.
 - Lists, searches, backlinks, and tags use zero-based result offsets. `read_note` uses 1-based line offsets. Return `has_more` and `next_offset` when more results remain; `count` means the current page size, not a total.
 - Search/backlinks are ordered by path then line; compact lists by path; detailed lists by modification time descending then path; tags by usage descending then tag. Preserve stable ordering for unchanged vault contents.
 - Search/backlink excerpts are capped at 240 Unicode characters plus an ellipsis when shortened. Omit unused optional response fields instead of emitting redundant nulls.
 - Preserve standard read-only/destructive/closed-world tool annotations. They inform clients but do not replace client approval policies.
-- Missing notes/folders are resource-not-found errors. Do not silently discard read failures and return an apparently complete successful result.
+- Missing notes, folders, and vaults are `isError` results that name the missing resource and how to find it. Do not silently discard read failures and return an apparently complete successful result.
 
 ## Filesystem Work and Writes
 
@@ -59,6 +62,9 @@
 - Line limits are not byte/token limits. Do not silently discard note content to claim a hard output ceiling.
 - `create_note` creates parent folders and must fail if the destination exists, including under concurrent creation. Preserve atomic no-replace publication; an existence check followed by overwrite-capable rename is insufficient.
 - `append_note`, `update_note`, and `patch_note` require an existing note. A patch requires exactly one matching snippet. Updates and patches use atomic replacement.
+- `read_note` joins lines with `\n`; `patch_note` must accept that text for a CRLF note and keep the note's CRLF endings. `append_note` starts on a new line without doubling an existing newline.
+- `update_note` rejects a mismatched `expected_total_lines` before writing. Atomic replacement keeps permissions and, on macOS and Windows, the creation date.
+- `delete_note` moves the note to `.trash` and `move_note` renames; both publish with a no-replace hard link and must never overwrite an existing note. Neither rewrites links.
 - Atomic writes are not transactions or version checks. Do not claim protection from conflicting external edits or hostile filesystem races.
 
 ## Testing

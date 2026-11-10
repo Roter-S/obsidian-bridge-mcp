@@ -109,15 +109,30 @@ impl Client {
     }
 
     async fn data(&mut self, name: &str, arguments: Value) -> Value {
+        let (is_error, text) = self.text(name, arguments).await;
+        assert!(!is_error, "{text}");
+        serde_json::from_str(&text).expect("successful results are JSON text")
+    }
+
+    // Every tool call answers with exactly one text block and no duplicate
+    // structured copy; failures are tool results the model can read.
+    async fn text(&mut self, name: &str, arguments: Value) -> (bool, String) {
         let reply = self.call(name, arguments).await;
         assert!(reply.get("error").is_none(), "{reply}");
-        assert_ne!(reply["result"]["isError"], true, "{reply}");
-        let data = reply["result"]["structuredContent"].clone();
-        assert!(
-            data.is_object(),
-            "missing portable structured output: {reply}"
-        );
-        data
+        let result = &reply["result"];
+        assert!(result.get("structuredContent").is_none(), "{reply}");
+        assert_eq!(result["content"].as_array().unwrap().len(), 1, "{reply}");
+        assert_eq!(result["content"][0]["type"], "text", "{reply}");
+        (
+            result["isError"] == true,
+            result["content"][0]["text"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    async fn failure(&mut self, name: &str, arguments: Value) -> String {
+        let (is_error, text) = self.text(name, arguments).await;
+        assert!(is_error, "expected a tool error: {text}");
+        text
     }
 }
 
@@ -180,11 +195,12 @@ async fn discovery_and_original_failures_are_actionable() {
         .await
         .to_string();
     assert!(missing.contains("folder not found"), "{missing}");
+    assert!(unknown.contains("BYTE, The Core"), "{unknown}");
     let missing_note = c
-        .call("read_note", json!({"vault":"BYTE", "path":"missing.md"}))
+        .failure("read_note", json!({"vault":"BYTE", "path":"missing.md"}))
         .await;
-    assert_eq!(missing_note["error"]["code"], -32002);
-    assert!(missing_note.to_string().contains("note not found"));
+    assert!(missing_note.contains("note not found: missing.md"));
+    assert!(missing_note.contains("list_notes"), "{missing_note}");
 }
 
 #[tokio::test]
@@ -202,7 +218,20 @@ async fn browsing_and_search_have_stable_complete_pages() {
         loop {
             let page = c.data("list_notes", json!({"folder":"Projects/SZAPETA", "limit":1, "offset":offset, "details":details})).await;
             assert_eq!(page["count"], 1);
-            paths.push(page["notes"][0].as_str().unwrap().to_owned());
+            let path = if details {
+                assert!(page.get("notes").is_none(), "{page}");
+                assert!(
+                    page["details"][0]["modified"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with('Z')
+                );
+                &page["details"][0]["path"]
+            } else {
+                assert!(page.get("details").is_none(), "{page}");
+                &page["notes"][0]
+            };
+            paths.push(path.as_str().unwrap().to_owned());
             if page["has_more"] == false {
                 assert!(page.get("next_offset").is_none());
                 break;
@@ -221,7 +250,9 @@ async fn browsing_and_search_have_stable_complete_pages() {
                 json!({"query":query, "path_only":path_only}),
             )
             .await;
-        let expected = all["matches"].as_array().unwrap();
+        let expected = flat_matches(&all);
+        assert_eq!(all["count"], expected.len());
+        assert_eq!(expected.len(), if path_only { 3 } else { 6 });
         let mut matches = Vec::new();
         for offset in 0..expected.len() {
             let page = c
@@ -230,13 +261,14 @@ async fn browsing_and_search_have_stable_complete_pages() {
                     json!({"query":query, "path_only":path_only, "limit":1, "offset":offset}),
                 )
                 .await;
-            matches.push(page["matches"][0].clone());
+            matches.extend(flat_matches(&page));
+            assert_eq!(page["count"], 1);
             assert_eq!(page["has_more"], offset + 1 < expected.len());
             if path_only {
-                assert!(page["matches"][0].get("excerpt").is_none());
+                assert_eq!(page["matches"][0], json!({"path": expected[offset].0}));
             }
         }
-        assert_eq!(&matches, expected);
+        assert_eq!(matches, expected);
     }
     let empty = c
         .data("search_notes", json!({"query":"needle", "offset":999}))
@@ -305,12 +337,8 @@ async fn partial_pages_stop_before_unvisited_subtrees_and_surface_later_errors()
         ("list_notes", json!({"limit":1,"details":true})),
         ("list_tags", json!({})),
     ] {
-        let error = c.call(tool, arguments).await;
-        assert!(error.get("error").is_some(), "{error}");
-        assert!(
-            error.to_string().contains("symlinks are not allowed"),
-            "{error}"
-        );
+        let error = c.failure(tool, arguments).await;
+        assert!(error.contains("symlinks are not allowed"), "{error}");
     }
     for (tool, arguments) in [
         ("search_notes", json!({"query":"match","limit":1})),
@@ -321,12 +349,8 @@ async fn partial_pages_stop_before_unvisited_subtrees_and_surface_later_errors()
         assert_eq!(first["has_more"], true);
         let mut next = arguments;
         next["offset"] = json!(1);
-        let error = c.call(tool, next).await;
-        assert!(error.get("error").is_some(), "{error}");
-        assert!(
-            error.to_string().contains("symlinks are not allowed"),
-            "{error}"
-        );
+        let error = c.failure(tool, next).await;
+        assert!(error.contains("symlinks are not allowed"), "{error}");
     }
 }
 
@@ -339,13 +363,13 @@ async fn unsafe_paths_are_rejected_over_the_wire() {
         ".obsidian/config.md",
         "plain.txt",
     ] {
-        let result = c
-            .call("create_note", json!({"path":path,"content":"no"}))
+        c.failure("create_note", json!({"path":path,"content":"no"}))
             .await;
-        assert!(
-            result.get("error").is_some(),
-            "unsafe input accepted: {result}"
-        );
+        for tool in ["delete_note", "read_note"] {
+            c.failure(tool, json!({"path":path})).await;
+        }
+        c.failure("move_note", json!({"path":path,"new_path":"moved.md"}))
+            .await;
     }
     #[cfg(unix)]
     {
@@ -367,8 +391,16 @@ async fn snippets_and_auxiliary_results_are_bounded_and_pageable() {
         c.note(&format!("{name}.md"), &format!("{long_line}\n#tag{name}"));
     }
     let matches = c.data("search_notes", json!({"query":"needle"})).await;
+    assert_eq!(matches["count"], 3);
     for item in matches["matches"].as_array().unwrap() {
-        assert!(item["excerpt"].as_str().unwrap().chars().count() <= 241);
+        assert_eq!(
+            item["lines"][0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            241
+        );
     }
     let backlinks = c
         .data("get_backlinks", json!({"path":"Target", "limit":1}))
@@ -389,4 +421,142 @@ async fn snippets_and_auxiliary_results_are_bounded_and_pageable() {
     let rest = c.data("list_tags", json!({"limit":1,"offset":2})).await;
     assert_eq!(rest["count"], 1);
     assert_eq!(rest["has_more"], false);
+}
+
+// (path, line) per matching line; path-only matches report line 0.
+fn flat_matches(page: &Value) -> Vec<(String, u64)> {
+    let mut flat = Vec::new();
+    for note in page["matches"].as_array().unwrap() {
+        let path = note["path"].as_str().unwrap().to_owned();
+        match note.get("lines") {
+            None => flat.push((path, 0)),
+            Some(lines) => {
+                for line in lines.as_array().unwrap() {
+                    assert!(line["excerpt"].is_string());
+                    flat.push((path.clone(), line["line"].as_u64().unwrap()));
+                }
+            }
+        }
+    }
+    flat
+}
+
+#[tokio::test]
+async fn schemas_are_strict_and_results_are_not_duplicated() {
+    let mut c = Client::start(false).await;
+    let tools = c.request("tools/list", json!({})).await;
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for name in ["delete_note", "move_note", "update_note", "list_notes"] {
+        assert!(names.contains(&name), "{names:?}");
+    }
+    for tool in tools {
+        assert!(tool.get("outputSchema").is_none(), "{tool}");
+        if tool["name"] != "list_vaults" {
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{tool}");
+        }
+        if ["delete_note", "move_note"].contains(&tool["name"].as_str().unwrap()) {
+            assert_eq!(tool["annotations"]["readOnlyHint"], false);
+            assert_eq!(tool["annotations"]["destructiveHint"], true);
+        }
+    }
+    // An invented argument is rejected, not silently ignored.
+    c.note("a.md", "text");
+    let unknown = c
+        .call("read_note", json!({"path":"a.md", "line_offset":3}))
+        .await
+        .to_string();
+    assert!(unknown.contains("line_offset"), "{unknown}");
+    assert!(!unknown.contains("\"content\":\"text\""), "{unknown}");
+}
+
+#[tokio::test]
+async fn edits_are_exact_and_deleted_notes_leave_search() {
+    let mut c = Client::start(false).await;
+    c.note("crlf.md", "uno\r\ndos\r\ntres");
+    let read = c.data("read_note", json!({"path":"crlf.md"})).await;
+    assert_eq!(
+        read,
+        json!({"content":"uno\ndos\ntres", "total_lines":3, "lines_read":3, "has_more":false})
+    );
+    // The text a caller just read is a valid patch, whatever the line endings.
+    let patched = c
+        .data(
+            "patch_note",
+            json!({"path":"crlf.md", "old_text":"uno\ndos", "new_text":"canción"}),
+        )
+        .await;
+    assert_eq!(patched, json!({"patched":true}));
+    assert_eq!(
+        c.data("append_note", json!({"path":"crlf.md", "content":"cuatro"}))
+            .await,
+        json!({"updated":true})
+    );
+    let root = c._vault.path().join("BYTE");
+    assert_eq!(
+        std::fs::read_to_string(root.join("crlf.md")).unwrap(),
+        "canción\r\ntres\ncuatro"
+    );
+    let missing = c
+        .failure(
+            "patch_note",
+            json!({"path":"crlf.md", "old_text":"absent", "new_text":"x"}),
+        )
+        .await;
+    assert!(missing.contains("read_note"), "{missing}");
+
+    let stale = c
+        .failure(
+            "update_note",
+            json!({"path":"crlf.md", "content":"short", "expected_total_lines":2}),
+        )
+        .await;
+    assert!(stale.contains("has 3 lines"), "{stale}");
+    assert_eq!(
+        c.data(
+            "update_note",
+            json!({"path":"crlf.md", "content":"canción", "expected_total_lines":3}),
+        )
+        .await,
+        json!({"updated":true, "previous_total_lines":3, "total_lines":1})
+    );
+
+    let found = c.data("search_notes", json!({"query":"CANCION"})).await;
+    assert_eq!(
+        found["matches"],
+        json!([{"path":"crlf.md", "lines":[{"line":1, "excerpt":"canción"}]}])
+    );
+    let tagged = c.data("list_notes", json!({"tag":"missing"})).await;
+    assert_eq!(tagged, json!({"notes":[], "count":0, "has_more":false}));
+
+    let moved = c
+        .data(
+            "move_note",
+            json!({"path":"crlf.md", "new_path":"Projects/song.md"}),
+        )
+        .await;
+    assert_eq!(moved, json!({"moved":true}));
+    let deleted = c
+        .data("delete_note", json!({"path":"Projects/song.md"}))
+        .await;
+    assert_eq!(
+        deleted,
+        json!({"deleted":true, "trashed_to":".trash/song.md"})
+    );
+    assert!(root.join(".trash/song.md").is_file());
+    for (tool, arguments) in [
+        ("search_notes", json!({"query":"cancion"})),
+        ("search_notes", json!({"query":"song", "path_only":true})),
+        ("list_notes", json!({})),
+    ] {
+        assert_eq!(c.data(tool, arguments).await["count"], 0);
+    }
+    assert_eq!(
+        c.data("list_notes", json!({"folder":".trash"})).await["notes"],
+        json!([".trash/song.md"])
+    );
+    let gone = c
+        .failure("delete_note", json!({"path":"Projects/song.md"}))
+        .await;
+    assert!(gone.contains("note not found"), "{gone}");
 }

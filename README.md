@@ -11,16 +11,52 @@ Rust MCP server for connecting Obsidian vaults to AI assistants (Pi, OpenCode, C
 - Safe markdown-only note access
 - MCP tools:
   - `list_vaults`
-  - `list_notes` (compact paths by default, optional `details`)
+  - `list_notes` (compact paths by default, optional `details` and `tag` filter)
   - `read_note` (200 lines by default; paginated with `offset` and `limit`)
   - `get_note_outline` (headings/TOC with line numbers)
   - `patch_note` (token-efficient find & replace)
-  - `search_notes` (ordered streaming search with early stop; optional `path_only`)
+  - `search_notes` (ordered streaming search with early stop, ignoring case and accents; optional `path_only`)
   - `get_backlinks` (find wikilinks `[[...]]` pointing to a note)
   - `list_tags` (all `#tags` and frontmatter tags)
   - `create_note` (atomic write)
   - `append_note`
-  - `update_note` (atomic write)
+  - `update_note` (atomic write; optional `expected_total_lines` guard)
+  - `move_note` (move or rename; never replaces an existing note)
+  - `delete_note` (moves the note to the vault's `.trash`)
+
+## Performance
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmark-dark.svg">
+  <img src="docs/assets/benchmark-light.svg" alt="Bar chart of median request times on a synthetic vault of 20,000 generated notes: paged requests take about 1 ms, deeper pages take 11 to 16 ms, and reading the whole vault takes 40 to 1,056 ms." width="800">
+</picture>
+
+A request for one page of results stops reading as soon as the page is full, so it takes about a millisecond at any page size. A page deep in the results, or one whose matches are spread thinly, reads more notes before it fills. Reading everything costs a pass over the vault, and following `next_offset` to the end repeats part of that pass on every page.
+
+| Request | 2,000 notes | 20,000 notes |
+| --- | ---: | ---: |
+| List 100 notes | 0.23 ms | 0.84 ms |
+| List 500 notes (largest page) | 0.64 ms | 0.93 ms |
+| Search paths, 200 matches | 0.34 ms | 0.82 ms |
+| Search content, 20 matches | 0.20 ms | 0.81 ms |
+| Search content, 200 matches (largest page) | 0.50 ms | 1.10 ms |
+| List 100 notes from the middle of the vault | 1.2 ms | 11 ms |
+| Backlinks, 50 matches (1 note in 20 links to the target) | 13 ms | 14 ms |
+| Search content, 200 matches starting at match 10,000 | 15 ms | 16 ms |
+| Newest 500 notes with dates | 3.3 ms | 40 ms |
+| Count every tag | 18 ms | 167 ms |
+| Every match of a rare phrase, typed without its accent | 28 ms | 391 ms |
+| Search content, none found | 28 ms | 392 ms |
+| List every note, 500 per page | 5.3 ms | 433 ms |
+| Every backlink, 200 per page | 26 ms | 1,056 ms |
+
+Reading 200 lines from a 100,000-line note takes 3.4 ms; reading 500 lines starting at line 90,000 takes 3.5 ms.
+
+These are medians of nine runs on an Apple M3 Pro against temporary vaults that the benchmark generates (20 folders, notes of 12 to 51 lines, a third of the lines accented; 63,120 and 631,200 lines in total) with a warm filesystem cache. They are not measurements of a real vault. They time the vault operations inside the server, not a cold disk or a full MCP round trip through a client, and they are not a comparison with other servers. Reproduce them with:
+
+```bash
+cargo test --locked --release vault::benchmarks::synthetic_vault -- --ignored --nocapture
+```
 
 ## Installation
 
@@ -105,7 +141,8 @@ For progress updates, append to `Projects/nexus-core-backend/00-Overview.md`.
 2. Browse a folder with `list_notes`. Do not use `search_notes` with `query: ""`.
 3. Search with a **non-empty literal** query; use `path_only: true` when looking for filenames/paths without reading note bodies.
 4. Read only relevant lines. `read_note` defaults to 200 lines and clamps `limit` to 1–500. Use outlines when structure is useful, not automatically before every small read.
-5. Prefer `patch_note` for a small unique edit, `append_note` for additions, and `update_note` only for an intentional full replacement.
+5. Prefer `patch_note` for a small unique edit, `append_note` for additions, and `update_note` only for an intentional full replacement, with `expected_total_lines` from your last read.
+6. `delete_note` moves a note to `.trash`; `move_note` renames or restores it.
 
 `list_notes`, `search_notes`, `get_backlinks`, and `list_tags` return `count` (this page), `has_more`, and `next_offset` when more results exist. Pass that offset with the same filters to continue. Their offsets are **zero-based result counts**. `read_note` uses **1-based line offsets** and also returns `has_more` / `next_offset`. Do not fetch more pages unless the task needs them.
 

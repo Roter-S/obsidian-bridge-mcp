@@ -37,13 +37,17 @@ Call `list_notes` when you want to discover notes without a search term:
 }
 ```
 
-The list includes notes in subfolders. Omit `folder` to browse the whole vault. Compact note paths are returned by default; add `details: true` only when you need titles, modification dates, and sizes.
+The list includes notes in subfolders. Omit `folder` to browse the whole vault. Compact note paths are returned in `notes` by default. Add `details: true` only when you need modification dates and sizes: the response then carries `details` (`path`, `modified`, `size`) instead of `notes`.
+
+Add `tag` to keep only notes carrying a tag, whether written inline (`#dev`) or in YAML frontmatter. A tag also matches its nested tags, so `dev` finds `#dev/backend`. Filtering by tag reads note bodies.
+
+Folders whose names start with a dot, such as `.trash` and `.git`, are skipped by listings, searches, backlinks, and tags. Name one explicitly as `folder` (for example `.trash`) to browse it.
 
 **Do not use `search_notes` with an empty query to list a folder.**
 
 ## Search for notes or text
 
-Call `search_notes` with a non-empty, case-insensitive literal query. Queries are not regular expressions.
+Call `search_notes` with a non-empty literal query. Matching ignores case and accents, so `cancion` finds `Canción`. Queries are not regular expressions.
 
 To find text in note contents:
 
@@ -68,7 +72,25 @@ To find filenames or paths without reading note contents:
 }
 ```
 
-Content matches include a path, a 1-based line number, and a preview of up to 240 characters plus an ellipsis if shortened. A preview may omit text near the end of a long line; read the original note at the returned line when needed. Path-only matches omit the preview.
+Matching lines are grouped under their note, so each path appears once per page:
+
+```json
+{
+  "matches": [
+    {
+      "path": "Projects/SZAPETA/Overview.md",
+      "lines": [
+        { "line": 4, "excerpt": "Pending review" },
+        { "line": 19, "excerpt": "pending: deploy" }
+      ]
+    }
+  ],
+  "count": 2,
+  "has_more": false
+}
+```
+
+`limit`, `offset`, and `count` are measured in matching lines, not notes. Each line has a 1-based line number and a preview of up to 240 characters plus an ellipsis if shortened. A preview may omit text near the end of a long line; read the original note at the returned line when needed. Path-only matches contain only `path`.
 
 ## Read only what you need
 
@@ -101,7 +123,7 @@ An outline returns headings instead of the body. You do not need to request an o
 | Tool | Default limit | Maximum limit | `offset` means | Result order |
 | --- | ---: | ---: | --- | --- |
 | `list_notes` | 100 | 500 | Zero-based number of notes to skip | Path; with `details: true`, newest modification first, then path |
-| `search_notes` | 20 | 200 | Zero-based number of matches to skip | Path, then line |
+| `search_notes` | 20 | 200 | Zero-based number of matching lines (or paths with `path_only`) to skip | Path, then line |
 | `get_backlinks` | 50 | 200 | Zero-based number of matching lines to skip | Path, then line |
 | `list_tags` | 100 | 500 | Zero-based number of tags to skip | Usage descending, then tag |
 | `read_note` | 200 | 500 | **1-based starting line** | Document order |
@@ -145,14 +167,18 @@ Use `patch_note` for a small change instead of sending the entire document:
 }
 ```
 
-`old_text` must match exactly once. If it appears multiple times, include more surrounding text to identify the intended occurrence.
+`old_text` must match exactly once, including whitespace. Copy it from `read_note`; it may span several lines, and a note saved with Windows line endings accepts the text exactly as `read_note` returned it. If the text appears multiple times, the error lists the lines where it starts; include more surrounding text to identify the intended occurrence.
 
 Choose the write tool according to the task:
 
 - `create_note`: create a new note; fails if the destination already exists. Parent folders are created as needed.
-- `append_note`: add content to the end of an existing note. Include any required newline in `content`.
+- `append_note`: add content to the end of an existing note. The content always starts on a new line; you do not need to begin it with a newline.
 - `patch_note`: replace one unique existing text snippet.
-- `update_note`: intentionally replace the entire contents of an existing note.
+- `update_note`: intentionally replace the entire contents of an existing note. Pass `expected_total_lines` with the `total_lines` from your latest `read_note`; the write is rejected if the note has a different number of lines, which catches replacing a long note after reading only its first page. The response reports `previous_total_lines` and `total_lines`.
+- `move_note`: move or rename a note to `new_path`; fails if the destination exists. Links in other notes are not rewritten, so check `get_backlinks` afterwards.
+- `delete_note`: move a note to the vault's `.trash` folder, as Obsidian does, and return its new location in `trashed_to`. Restore it with `move_note` from that path.
+
+On macOS and Windows, `patch_note` and `update_note` keep the note's creation date. Other systems do not allow setting it, so a rewritten note gets a new one there.
 
 Avoid simultaneous edits to the same note from multiple agents or Obsidian. A completed write does not guarantee that another editor has not changed the note since you last read it. Do not automatically retry an append after an uncertain connection failure: it may append the content twice.
 
@@ -168,7 +194,7 @@ Call `get_backlinks` to find lines containing wikilinks to a note:
 }
 ```
 
-Results are matching lines, not necessarily distinct source notes. Backlink matching is not a complete replacement for Obsidian's link resolver; duplicate note titles and relative links can be ambiguous.
+Results are matching lines, not necessarily distinct source notes. When you pass a path, only that note is excluded as a source; when you pass a bare title, every note with that title is. Backlink matching is not a complete replacement for Obsidian's link resolver; duplicate note titles and relative links can be ambiguous.
 
 Call `list_tags` to list tags and their note counts:
 
@@ -179,14 +205,19 @@ Call `list_tags` to list tags and their note counts:
 }
 ```
 
-Tag listing scans the vault. Reuse the returned information when it is still sufficient instead of requesting it repeatedly.
+Tag listing scans the vault. Reuse the returned information when it is still sufficient instead of requesting it repeatedly. To find the notes that carry a tag, call `list_notes` with `tag`.
 
 ## Troubleshooting
+
+Every tool answers with one block of JSON text. A failed call is returned as a tool result marked `isError`, with a message that says how to correct the call.
 
 | Message or symptom | What to do |
 | --- | --- |
 | `multiple vaults are configured` | Pass `vault` with an exact name from the error or `list_vaults`. |
-| `unknown vault` | Check the configured name; a project folder is not a vault name. |
+| `unknown vault` | Use one of the exact names listed in the error; a project folder is not a vault name. |
+| `unknown field` | Remove the argument the tool does not define. Arguments are never silently ignored. |
+| `has N lines, not the expected M` | The note changed or was only partly read. Read every page, then retry `update_note`, or use `patch_note`. |
+| A deleted note is needed again | Browse `list_notes` with `folder: ".trash"` and restore the note with `move_note`. |
 | `search query cannot be empty` | Supply a search term, or use `list_notes` to browse a folder. Whitespace-only queries are also rejected. |
 | `folder not found` / `note not found` | Check the selected vault and the vault-relative path. Use `list_notes` to discover existing note paths. |
 | `path cannot be empty` | Supply a note path or folder where required; omit the optional `folder` field to use the vault root. |
