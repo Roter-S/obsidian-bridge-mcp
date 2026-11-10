@@ -13,10 +13,10 @@ use tempfile::TempDir;
 
 use super::Vault;
 
-const FOLDERS: usize = 20;
-const RARE_EVERY: usize = 100; // notes containing the accented rare phrase
-const LINK_EVERY: usize = 20; // notes linking to [[Target]]
-const TOPICS: usize = 50; // distinct inline tags
+pub(crate) const FOLDERS: usize = 20;
+pub(crate) const RARE_EVERY: usize = 100; // notes containing the accented rare phrase
+pub(crate) const LINK_EVERY: usize = 20; // notes linking to [[Target]]
+pub(crate) const TOPICS: usize = 50; // distinct inline tags
 
 async fn measure<T, F: Future<Output = T>>(name: &str, mut operation: impl FnMut() -> F) {
     black_box(operation().await); // Warm filesystem caches; not a cold-disk benchmark.
@@ -60,7 +60,8 @@ fn note_body(index: usize) -> String {
     body
 }
 
-async fn benchmark_notes(note_count: usize) {
+/// A disposable vault of generated notes; returns it with its total line count.
+pub(crate) fn build_vault(note_count: usize) -> (TempDir, usize) {
     let temp = TempDir::new().unwrap();
     std::fs::create_dir(temp.path().join(".obsidian")).unwrap();
     let mut lines = 0;
@@ -73,6 +74,11 @@ async fn benchmark_notes(note_count: usize) {
             std::fs::write(directory.join(format!("note-{note:05}.md")), body).unwrap();
         }
     }
+    (temp, lines)
+}
+
+async fn benchmark_notes(note_count: usize) {
+    let (temp, lines) = build_vault(note_count);
     let vault = &Vault::new("benchmark".into(), temp.path().to_path_buf()).unwrap();
     let rare = note_count / RARE_EVERY;
     let links = note_count / LINK_EVERY;

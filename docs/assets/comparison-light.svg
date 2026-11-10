@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 790" width="800" height="790" role="img" aria-labelledby="t d" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title id="t">Obsidian Bridge MCP compared with ripgrep on a synthetic vault of 20,000 generated notes</title>
+  <desc id="d">Estimated tokens returned to the model, as plain ripgrep command, ripgrep limited with head, and obm. List the notes: 120,004, 600, 608. Find a common word: 3,828,500, 418, 353. Read a 2,000-line note with cat and sed: 33,224, 3,273, 3,283. Notes that link to a note: 13,750, 688, 734. Notes with a tag: 2,400, 600, 608. Median time in milliseconds, ripgrep then obm. List 100 notes: 11, 0.80. Find a common word: 7.9, 0.85. Phrase typed without its accent: 149 and finds nothing, 30. Read 200 lines: 3.6, 0.11. Backlinks: 18, 14. Count every tag: 242 and misses 7 tags, 167. Notes with a tag: 44, 79.</desc>
+  <rect width="800" height="790" rx="12" fill="#fcfcfb"/>
+  <rect x="0.5" y="0.5" width="799" height="789" rx="11.5" fill="none" stroke="#e4e3df"/>
+
+  <text x="24" y="38" font-size="20" font-weight="600" fill="#0b0b0b">Same questions, with and without the server</text>
+  <text x="24" y="60" font-size="13" fill="#52514e">Synthetic benchmark: 20,000 generated notes. Further left is better.</text>
+
+  <g font-size="13" fill="#0b0b0b">
+    <circle cx="30" cy="84" r="5" fill="#eb6834"/>
+    <text x="42" y="88">ripgrep, plain command</text>
+    <circle cx="222" cy="84" r="5" fill="#1baf7a"/>
+    <text x="234" y="88">ripgrep, limited with head</text>
+    <circle cx="432" cy="84" r="5" fill="#2a78d6"/>
+    <text x="444" y="88">obm</text>
+  </g>
+
+  <text x="24" y="126" font-size="14" font-weight="600" fill="#0b0b0b">What the model has to read (estimated tokens)</text>
+  <g stroke="#e4e3df" stroke-width="1">
+    <line x1="290.5" y1="138" x2="290.5" y2="360"/>
+    <line x1="374.5" y1="138" x2="374.5" y2="360"/>
+    <line x1="458.5" y1="138" x2="458.5" y2="360"/>
+    <line x1="542.5" y1="138" x2="542.5" y2="360"/>
+    <line x1="626.5" y1="138" x2="626.5" y2="360"/>
+    <line x1="710.5" y1="138" x2="710.5" y2="360"/>
+  </g>
+  <g font-size="13" fill="#52514e">
+    <text x="24" y="164">List the notes</text>
+    <text x="24" y="208">Find a common word</text>
+    <text x="24" y="252">Read a 2,000-line note</text>
+    <text x="24" y="296">Notes that link to a note</text>
+    <text x="24" y="340">Notes with a tag</text>
+  </g>
+  <g stroke="#fcfcfb" stroke-width="2">
+    <g fill="#eb6834">
+      <circle cx="548.7" cy="151" r="5"/>
+      <circle cx="675.0" cy="195" r="5"/>
+      <circle cx="501.8" cy="239" r="5"/>
+      <circle cx="469.6" cy="283" r="5"/>
+      <circle cx="405.9" cy="327" r="5"/>
+    </g>
+    <g fill="#1baf7a">
+      <circle cx="355.4" cy="160" r="5"/>
+      <circle cx="342.2" cy="204" r="5"/>
+      <circle cx="417.3" cy="248" r="5"/>
+      <circle cx="360.4" cy="292" r="5"/>
+      <circle cx="355.4" cy="336" r="5"/>
+    </g>
+    <g fill="#2a78d6">
+      <circle cx="355.9" cy="169" r="5"/>
+      <circle cx="336.0" cy="213" r="5"/>
+      <circle cx="417.4" cy="257" r="5"/>
+      <circle cx="362.7" cy="301" r="5"/>
+      <circle cx="355.9" cy="345" r="5"/>
+    </g>
+  </g>
+  <g font-size="12" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="4" stroke-linejoin="round" paint-order="stroke">
+    <text x="558" y="155">120,004</text>
+    <text x="685" y="199">3,828,500</text>
+    <text x="511" y="243">33,224</text>
+    <text x="479" y="287">13,750</text>
+    <text x="415" y="331">2,400</text>
+    <g text-anchor="end">
+      <text x="346" y="164">600</text>
+      <text x="333" y="208">418</text>
+      <text x="408" y="252">3,273</text>
+      <text x="351" y="296">688</text>
+      <text x="346" y="340">600</text>
+    </g>
+    <text x="365" y="173">608</text>
+    <text x="345" y="217">353</text>
+    <text x="427" y="261">3,283</text>
+    <text x="372" y="305">734</text>
+    <text x="365" y="349">608</text>
+  </g>
+  <g font-size="12" fill="#52514e" text-anchor="middle">
+    <text x="290" y="378">100</text>
+    <text x="374" y="378">1,000</text>
+    <text x="458" y="378">10,000</text>
+    <text x="542" y="378">100,000</text>
+    <text x="626" y="378">1 million</text>
+    <text x="710" y="378">10 million</text>
+  </g>
+
+  <text x="24" y="426" font-size="14" font-weight="600" fill="#0b0b0b">How long the answer takes (median)</text>
+  <g stroke="#e4e3df" stroke-width="1">
+    <line x1="290.5" y1="438" x2="290.5" y2="710"/>
+    <line x1="395.5" y1="438" x2="395.5" y2="710"/>
+    <line x1="500.5" y1="438" x2="500.5" y2="710"/>
+    <line x1="605.5" y1="438" x2="605.5" y2="710"/>
+    <line x1="710.5" y1="438" x2="710.5" y2="710"/>
+  </g>
+  <g font-size="13" fill="#52514e">
+    <text x="24" y="462">List 100 notes</text>
+    <text x="24" y="498">Find a common word, 20 matches</text>
+    <text x="24" y="534">Phrase typed without its accent</text>
+    <text x="24" y="570">Read 200 lines</text>
+    <text x="24" y="606">Backlinks, 50 matches</text>
+    <text x="24" y="642">Count every tag</text>
+    <text x="24" y="678">Notes with a tag, first 100</text>
+  </g>
+  <g stroke="#fcfcfb" stroke-width="2">
+    <g fill="#1baf7a">
+      <circle cx="504.1" cy="453" r="5"/>
+      <circle cx="489.1" cy="489" r="5"/>
+      <circle cx="452.9" cy="561" r="5"/>
+      <circle cx="525.9" cy="597" r="5"/>
+      <circle cx="567.7" cy="669" r="5"/>
+    </g>
+    <g fill="#eb6834">
+      <circle cx="623.2" cy="525" r="5"/>
+      <circle cx="645.2" cy="633" r="5"/>
+    </g>
+    <g fill="#2a78d6">
+      <circle cx="384.8" cy="463" r="5"/>
+      <circle cx="387.6" cy="499" r="5"/>
+      <circle cx="549.5" cy="535" r="5"/>
+      <circle cx="294.4" cy="571" r="5"/>
+      <circle cx="514.3" cy="607" r="5"/>
+      <circle cx="628.3" cy="643" r="5"/>
+      <circle cx="594.3" cy="679" r="5"/>
+    </g>
+  </g>
+  <g font-size="12" font-weight="600" fill="#0b0b0b" stroke="#fcfcfb" stroke-width="4" stroke-linejoin="round" paint-order="stroke">
+    <text x="514" y="457">11 ms</text>
+    <text x="499" y="493">7.9 ms</text>
+    <text x="633" y="529">149 ms, finds nothing</text>
+    <text x="463" y="565">3.6 ms</text>
+    <text x="536" y="601">18 ms</text>
+    <text x="655" y="637">242 ms, misses 7 tags</text>
+    <g text-anchor="end">
+      <text x="558" y="673">44 ms</text>
+    </g>
+    <text x="394" y="467">0.80 ms</text>
+    <text x="397" y="503">0.85 ms</text>
+    <g text-anchor="end">
+      <text x="540" y="539">30 ms</text>
+    </g>
+    <text x="304" y="575">0.11 ms</text>
+    <g text-anchor="end">
+      <text x="505" y="611">14 ms</text>
+      <text x="619" y="647">167 ms</text>
+    </g>
+    <text x="604" y="683">79 ms</text>
+  </g>
+  <g font-size="12" fill="#52514e" text-anchor="middle">
+    <text x="290" y="728">0.1 ms</text>
+    <text x="395" y="728">1 ms</text>
+    <text x="500" y="728">10 ms</text>
+    <text x="605" y="728">100 ms</text>
+    <text x="710" y="728">1 second</text>
+  </g>
+
+  <text x="24" y="756" font-size="11" fill="#52514e">Both scales are logarithmic: each step is ten times the one before. Tokens are estimated as bytes ÷ 4. The long note is read with cat and sed.</text>
+  <text x="24" y="772" font-size="11" fill="#52514e">Apple M3 Pro, ripgrep 15.2, warm filesystem cache, median of 5 runs. Server calls are timed in-process.</text>
+</svg>

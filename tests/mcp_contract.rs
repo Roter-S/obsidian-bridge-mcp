@@ -108,10 +108,14 @@ impl Client {
             .await
     }
 
-    async fn data(&mut self, name: &str, arguments: Value) -> Value {
+    async fn ok(&mut self, name: &str, arguments: Value) -> String {
         let (is_error, text) = self.text(name, arguments).await;
         assert!(!is_error, "{text}");
-        serde_json::from_str(&text).expect("successful results are JSON text")
+        text
+    }
+
+    async fn page(&mut self, name: &str, arguments: Value) -> Page {
+        Page::parse(&self.ok(name, arguments).await)
     }
 
     // Every tool call answers with exactly one text block and no duplicate
@@ -136,15 +140,79 @@ impl Client {
     }
 }
 
+// A result as a caller reads it: `[N things; more: offset=K]` or `[N things; end]`
+// on the first line, then one line per item.
+#[derive(Debug)]
+struct Page {
+    status: String,
+    lines: Vec<String>,
+    count: u64,
+    next: Option<u64>,
+}
+
+impl Page {
+    fn parse(text: &str) -> Self {
+        let mut lines = text.lines().map(str::to_owned);
+        let status = lines.next().expect("status line");
+        assert!(status.starts_with('[') && status.ends_with(']'), "{text}");
+        let count = status[1..]
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .expect("status starts with a count");
+        let next = status
+            .trim_end_matches(']')
+            .split_once("more: offset=")
+            .map(|(_, offset)| offset.parse().expect("numeric offset"));
+        assert!(next.is_some() || status.ends_with("; end]"), "{status}");
+        Self {
+            status,
+            lines: lines.collect(),
+            count,
+            next,
+        }
+    }
+
+    // (path, line) per matching line; a path-only match reports line 0.
+    fn matches(&self) -> Vec<(String, u64)> {
+        let mut flat = Vec::new();
+        let mut path = String::new();
+        let mut path_had_lines = true;
+        for line in &self.lines {
+            if let Some(hit) = line.strip_prefix("  ") {
+                let (number, _excerpt) = hit.split_once(": ").expect("line: text");
+                flat.push((path.clone(), number.parse().unwrap()));
+                path_had_lines = true;
+            } else {
+                if !path_had_lines {
+                    flat.push((path.clone(), 0));
+                }
+                path = line.clone();
+                path_had_lines = false;
+            }
+        }
+        if !path_had_lines {
+            flat.push((path, 0));
+        }
+        flat
+    }
+}
+
 #[tokio::test]
 async fn discovery_and_original_failures_are_actionable() {
     let mut c = Client::start(true).await;
     let instructions = c.info["result"]["instructions"].as_str().unwrap();
     assert!(instructions.contains("BYTE") && instructions.contains("The Core"));
     assert!(instructions.contains("list_notes") && instructions.contains("non-empty"));
+    assert!(instructions.contains("more: offset=N") && instructions.contains("`end`"));
     assert_eq!(
         c.info["result"]["serverInfo"]["version"],
         env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(
+        c.ok("list_vaults", json!({})).await,
+        "[2 vaults; end]\nBYTE\nThe Core"
     );
     let tools = c.request("tools/list", json!({})).await;
     let search = tools["result"]["tools"]
@@ -170,10 +238,7 @@ async fn discovery_and_original_failures_are_actionable() {
             .unwrap()
             .contains("list_notes")
     );
-    let ambiguous = c
-        .call("search_notes", json!({"query":"needle"}))
-        .await
-        .to_string();
+    let ambiguous = c.failure("search_notes", json!({"query":"needle"})).await;
     assert!(
         ambiguous.contains("BYTE") && ambiguous.contains("The Core") && ambiguous.contains("vault")
     );
@@ -185,17 +250,13 @@ async fn discovery_and_original_failures_are_actionable() {
         );
         assert!(!error.contains("path cannot be empty"));
     }
-    let unknown = c
-        .call("list_notes", json!({"vault":"typo"}))
-        .await
-        .to_string();
+    let unknown = c.failure("list_notes", json!({"vault":"typo"})).await;
     assert!(unknown.contains("unknown vault"));
-    let missing = c
-        .call("list_notes", json!({"vault":"BYTE", "folder":"missing"}))
-        .await
-        .to_string();
-    assert!(missing.contains("folder not found"), "{missing}");
     assert!(unknown.contains("BYTE, The Core"), "{unknown}");
+    let missing = c
+        .failure("list_notes", json!({"vault":"BYTE", "folder":"missing"}))
+        .await;
+    assert!(missing.contains("folder not found"), "{missing}");
     let missing_note = c
         .failure("read_note", json!({"vault":"BYTE", "path":"missing.md"}))
         .await;
@@ -216,27 +277,25 @@ async fn browsing_and_search_have_stable_complete_pages() {
         let mut paths = Vec::new();
         let mut offset = 0;
         loop {
-            let page = c.data("list_notes", json!({"folder":"Projects/SZAPETA", "limit":1, "offset":offset, "details":details})).await;
-            assert_eq!(page["count"], 1);
+            let page = c.page("list_notes", json!({"folder":"Projects/SZAPETA", "limit":1, "offset":offset, "details":details})).await;
+            assert_eq!(page.count, 1, "{page:?}");
+            assert_eq!(page.lines.len(), 1, "{page:?}");
+            let line = &page.lines[0];
             let path = if details {
-                assert!(page.get("notes").is_none(), "{page}");
-                assert!(
-                    page["details"][0]["modified"]
-                        .as_str()
-                        .unwrap()
-                        .ends_with('Z')
-                );
-                &page["details"][0]["path"]
+                // `modified bytes path`: a UTC time in whole seconds, then the size.
+                let fields: Vec<_> = line.splitn(3, ' ').collect();
+                assert!(fields[0].ends_with('Z') && fields[0].len() == 20, "{line}");
+                assert_eq!(fields[1], "26", "{line}");
+                fields[2].to_owned()
             } else {
-                assert!(page.get("details").is_none(), "{page}");
-                &page["notes"][0]
+                line.clone()
             };
-            paths.push(path.as_str().unwrap().to_owned());
-            if page["has_more"] == false {
-                assert!(page.get("next_offset").is_none());
-                break;
+            assert!(path.starts_with("Projects/SZAPETA/"), "{line}");
+            paths.push(path);
+            match page.next {
+                Some(next) => offset = next,
+                None => break,
             }
-            offset = page["next_offset"].as_u64().unwrap();
         }
         paths.sort();
         paths.dedup();
@@ -245,36 +304,43 @@ async fn browsing_and_search_have_stable_complete_pages() {
     for path_only in [false, true] {
         let query = if path_only { "SZAPETA" } else { "needle" };
         let all = c
-            .data(
+            .page(
                 "search_notes",
                 json!({"query":query, "path_only":path_only}),
             )
             .await;
-        let expected = flat_matches(&all);
-        assert_eq!(all["count"], expected.len());
+        let expected = all.matches();
+        assert_eq!(all.count, expected.len() as u64);
         assert_eq!(expected.len(), if path_only { 3 } else { 6 });
+        assert_eq!(all.next, None);
         let mut matches = Vec::new();
         for offset in 0..expected.len() {
             let page = c
-                .data(
+                .page(
                     "search_notes",
                     json!({"query":query, "path_only":path_only, "limit":1, "offset":offset}),
                 )
                 .await;
-            matches.extend(flat_matches(&page));
-            assert_eq!(page["count"], 1);
-            assert_eq!(page["has_more"], offset + 1 < expected.len());
-            if path_only {
-                assert_eq!(page["matches"][0], json!({"path": expected[offset].0}));
-            }
+            matches.extend(page.matches());
+            assert_eq!(page.count, 1);
+            let more = offset + 1 < expected.len();
+            assert_eq!(page.next, more.then_some(offset as u64 + 1), "{page:?}");
+            // A path-only match is the path alone; a content match adds one line.
+            assert_eq!(page.lines.len(), if path_only { 1 } else { 2 });
+            assert_eq!(page.lines[0], expected[offset].0);
         }
         assert_eq!(matches, expected);
     }
-    let empty = c
-        .data("search_notes", json!({"query":"needle", "offset":999}))
-        .await;
-    assert_eq!(empty["count"], 0);
-    assert_eq!(empty["has_more"], false);
+    assert_eq!(
+        c.ok("search_notes", json!({"query":"needle", "limit":3}))
+            .await,
+        "[3 matching lines; more: offset=3]\nProjects/SZAPETA/a.md\n  1: needle first\n  2: needle second\nProjects/SZAPETA/b.md\n  1: needle first"
+    );
+    assert_eq!(
+        c.ok("search_notes", json!({"query":"needle", "offset":999}))
+            .await,
+        "[0 matching lines; end]"
+    );
 }
 
 #[tokio::test]
@@ -282,40 +348,55 @@ async fn reads_are_paged_by_default_and_extreme_offsets_do_not_overflow() {
     let mut c = Client::start(false).await;
     let lines = (1..=650).map(|i| format!("line {i}")).collect::<Vec<_>>();
     c.note("large.md", &lines.join("\n"));
-    let first = c.data("read_note", json!({"path":"large.md"})).await;
-    assert_eq!(first["lines_read"], 200);
-    assert_eq!(first["total_lines"], 650);
-    assert_eq!(first["next_offset"], 201);
-    let capped = c
-        .data("read_note", json!({"path":"large.md", "limit":9999}))
-        .await;
-    assert_eq!(capped["lines_read"], 500);
-    assert_eq!(capped["next_offset"], 501);
-    assert_eq!(capped["content"], lines[..500].join("\n"));
-    let next = c
-        .data(
-            "read_note",
-            json!({"path":"large.md", "offset":first["next_offset"], "limit":9999}),
+    assert_eq!(
+        c.ok("read_note", json!({"path":"large.md"})).await,
+        format!(
+            "[lines 1-200 of 650; more: offset=201]\n{}",
+            lines[..200].join("\n")
         )
-        .await;
-    assert_eq!(next["lines_read"], 450);
-    assert_eq!(next["has_more"], false);
-    assert_eq!(next["content"], lines[200..].join("\n"));
-    let zero = c
-        .data(
-            "read_note",
-            json!({"path":"large.md", "offset":0, "limit":0}),
+    );
+    assert_eq!(
+        c.ok("read_note", json!({"path":"large.md", "limit":9999}))
+            .await,
+        format!(
+            "[lines 1-500 of 650; more: offset=501]\n{}",
+            lines[..500].join("\n")
         )
-        .await;
-    assert_eq!(zero["content"], "line 1");
-    let end = c
-        .data(
+    );
+    assert_eq!(
+        c.ok(
             "read_note",
-            json!({"path":"large.md", "offset":u32::MAX, "limit":500}),
+            json!({"path":"large.md", "offset":201, "limit":9999})
         )
-        .await;
-    assert_eq!(end["lines_read"], 0);
-    assert_eq!(end["has_more"], false);
+        .await,
+        format!("[lines 201-650 of 650; end]\n{}", lines[200..].join("\n"))
+    );
+    assert_eq!(
+        c.ok(
+            "read_note",
+            json!({"path":"large.md", "offset":0, "limit":0})
+        )
+        .await,
+        "[lines 1-1 of 650; more: offset=2]\nline 1"
+    );
+    assert_eq!(
+        c.ok(
+            "read_note",
+            json!({"path":"large.md", "offset":u32::MAX, "limit":500})
+        )
+        .await,
+        format!("[no lines at offset {}; note has 650 lines; end]", u32::MAX)
+    );
+    // Quotes, backslashes and tabs reach the caller exactly as stored.
+    c.note("raw.md", "say \"hi\"\\n\tend");
+    assert_eq!(
+        c.ok("read_note", json!({"path":"raw.md"})).await,
+        "[lines 1-1 of 1; end]\nsay \"hi\"\\n\tend"
+    );
+    assert_eq!(
+        c.ok("get_note_outline", json!({"path":"large.md"})).await,
+        "[0 headings; note has 650 lines]"
+    );
 }
 
 #[cfg(unix)]
@@ -328,10 +409,10 @@ async fn partial_pages_stop_before_unvisited_subtrees_and_surface_later_errors()
     let root = c._vault.path().join("BYTE");
     std::fs::create_dir(root.join("z")).unwrap();
     std::os::unix::fs::symlink(root.join("a.md"), root.join("z/link.md")).unwrap();
-    let first = c.data("list_notes", json!({"limit":1})).await;
-    assert_eq!(first["notes"], json!(["a.md"]));
-    assert_eq!(first["has_more"], true);
-    assert_eq!(first["next_offset"], 1);
+    assert_eq!(
+        c.ok("list_notes", json!({"limit":1})).await,
+        "[1 note; more: offset=1]\na.md"
+    );
     for (tool, arguments) in [
         ("list_notes", json!({"limit":1,"offset":1})),
         ("list_notes", json!({"limit":1,"details":true})),
@@ -344,9 +425,9 @@ async fn partial_pages_stop_before_unvisited_subtrees_and_surface_later_errors()
         ("search_notes", json!({"query":"match","limit":1})),
         ("get_backlinks", json!({"path":"Target","limit":1})),
     ] {
-        let first = c.data(tool, arguments.clone()).await;
-        assert_eq!(first["count"], 1);
-        assert_eq!(first["has_more"], true);
+        let first = c.page(tool, arguments.clone()).await;
+        assert_eq!(first.count, 1);
+        assert_eq!(first.next, Some(1));
         let mut next = arguments;
         next["offset"] = json!(1);
         let error = c.failure(tool, next).await;
@@ -390,55 +471,39 @@ async fn snippets_and_auxiliary_results_are_bounded_and_pageable() {
     for name in ["a", "b", "c"] {
         c.note(&format!("{name}.md"), &format!("{long_line}\n#tag{name}"));
     }
-    let matches = c.data("search_notes", json!({"query":"needle"})).await;
-    assert_eq!(matches["count"], 3);
-    for item in matches["matches"].as_array().unwrap() {
-        assert_eq!(
-            item["lines"][0]["excerpt"]
-                .as_str()
-                .unwrap()
-                .chars()
-                .count(),
-            241
-        );
+    let matches = c.page("search_notes", json!({"query":"needle"})).await;
+    assert_eq!(matches.count, 3);
+    assert_eq!(matches.lines.len(), 6);
+    for line in matches.lines.iter().skip(1).step_by(2) {
+        let excerpt = line.strip_prefix("  1: ").expect("indented line: text");
+        assert_eq!(excerpt.chars().count(), 241);
+        assert!(excerpt.ends_with('…'));
     }
     let backlinks = c
-        .data("get_backlinks", json!({"path":"Target", "limit":1}))
+        .page("get_backlinks", json!({"path":"Target", "limit":1}))
         .await;
-    assert_eq!(backlinks["count"], 1);
-    assert_eq!(backlinks["next_offset"], 1);
+    assert_eq!(backlinks.status, "[1 linking line; more: offset=1]");
+    assert_eq!(backlinks.matches(), [("a.md".to_owned(), 1)]);
     let next = c
-        .data("get_backlinks", json!({"path":"Target", "offset":1}))
+        .page("get_backlinks", json!({"path":"Target", "offset":1}))
         .await;
-    assert_eq!(next["count"], 2);
-    assert_ne!(
-        backlinks["backlinks"][0]["source_path"],
-        next["backlinks"][0]["source_path"]
+    assert_eq!(next.status, "[2 linking lines; end]");
+    assert_eq!(
+        next.matches(),
+        [("b.md".to_owned(), 1), ("c.md".to_owned(), 1)]
     );
-    let tags = c.data("list_tags", json!({"limit":1})).await;
-    assert_eq!(tags["count"], 1);
-    assert_eq!(tags["next_offset"], 1);
-    let rest = c.data("list_tags", json!({"limit":1,"offset":2})).await;
-    assert_eq!(rest["count"], 1);
-    assert_eq!(rest["has_more"], false);
-}
-
-// (path, line) per matching line; path-only matches report line 0.
-fn flat_matches(page: &Value) -> Vec<(String, u64)> {
-    let mut flat = Vec::new();
-    for note in page["matches"].as_array().unwrap() {
-        let path = note["path"].as_str().unwrap().to_owned();
-        match note.get("lines") {
-            None => flat.push((path, 0)),
-            Some(lines) => {
-                for line in lines.as_array().unwrap() {
-                    assert!(line["excerpt"].is_string());
-                    flat.push((path.clone(), line["line"].as_u64().unwrap()));
-                }
-            }
-        }
-    }
-    flat
+    assert_eq!(
+        c.ok("list_tags", json!({"limit":1})).await,
+        "[1 tag; more: offset=1]\ntaga 1"
+    );
+    assert_eq!(
+        c.ok("list_tags", json!({"limit":1,"offset":2})).await,
+        "[1 tag; end]\ntagc 1"
+    );
+    assert_eq!(
+        c.ok("get_note_outline", json!({"path":"a.md"})).await,
+        "[0 headings; note has 2 lines]"
+    );
 }
 
 #[tokio::test]
@@ -459,6 +524,10 @@ async fn schemas_are_strict_and_results_are_not_duplicated() {
             assert_eq!(tool["annotations"]["readOnlyHint"], false);
             assert_eq!(tool["annotations"]["destructiveHint"], true);
         }
+        // Descriptions must not point at fields the plain-text results no longer have.
+        let description = tool.to_string();
+        assert!(!description.contains("next_offset"), "{tool}");
+        assert!(!description.contains("has_more"), "{tool}");
     }
     // An invented argument is rejected, not silently ignored.
     c.note("a.md", "text");
@@ -467,30 +536,30 @@ async fn schemas_are_strict_and_results_are_not_duplicated() {
         .await
         .to_string();
     assert!(unknown.contains("line_offset"), "{unknown}");
-    assert!(!unknown.contains("\"content\":\"text\""), "{unknown}");
+    assert!(!unknown.contains("[lines"), "{unknown}");
 }
 
 #[tokio::test]
 async fn edits_are_exact_and_deleted_notes_leave_search() {
     let mut c = Client::start(false).await;
     c.note("crlf.md", "uno\r\ndos\r\ntres");
-    let read = c.data("read_note", json!({"path":"crlf.md"})).await;
     assert_eq!(
-        read,
-        json!({"content":"uno\ndos\ntres", "total_lines":3, "lines_read":3, "has_more":false})
+        c.ok("read_note", json!({"path":"crlf.md"})).await,
+        "[lines 1-3 of 3; end]\nuno\ndos\ntres"
     );
     // The text a caller just read is a valid patch, whatever the line endings.
-    let patched = c
-        .data(
+    assert_eq!(
+        c.ok(
             "patch_note",
             json!({"path":"crlf.md", "old_text":"uno\ndos", "new_text":"canción"}),
         )
-        .await;
-    assert_eq!(patched, json!({"patched":true}));
+        .await,
+        "patched"
+    );
     assert_eq!(
-        c.data("append_note", json!({"path":"crlf.md", "content":"cuatro"}))
+        c.ok("append_note", json!({"path":"crlf.md", "content":"cuatro"}))
             .await,
-        json!({"updated":true})
+        "appended"
     );
     let root = c._vault.path().join("BYTE");
     assert_eq!(
@@ -513,35 +582,35 @@ async fn edits_are_exact_and_deleted_notes_leave_search() {
         .await;
     assert!(stale.contains("has 3 lines"), "{stale}");
     assert_eq!(
-        c.data(
+        c.ok(
             "update_note",
             json!({"path":"crlf.md", "content":"canción", "expected_total_lines":3}),
         )
         .await,
-        json!({"updated":true, "previous_total_lines":3, "total_lines":1})
+        "updated; was 3 lines, now 1"
     );
 
-    let found = c.data("search_notes", json!({"query":"CANCION"})).await;
     assert_eq!(
-        found["matches"],
-        json!([{"path":"crlf.md", "lines":[{"line":1, "excerpt":"canción"}]}])
+        c.ok("search_notes", json!({"query":"CANCION"})).await,
+        "[1 matching line; end]\ncrlf.md\n  1: canción"
     );
-    let tagged = c.data("list_notes", json!({"tag":"missing"})).await;
-    assert_eq!(tagged, json!({"notes":[], "count":0, "has_more":false}));
+    assert_eq!(
+        c.ok("list_notes", json!({"tag":"missing"})).await,
+        "[0 notes; end]"
+    );
 
-    let moved = c
-        .data(
+    assert_eq!(
+        c.ok(
             "move_note",
             json!({"path":"crlf.md", "new_path":"Projects/song.md"}),
         )
-        .await;
-    assert_eq!(moved, json!({"moved":true}));
-    let deleted = c
-        .data("delete_note", json!({"path":"Projects/song.md"}))
-        .await;
+        .await,
+        "moved"
+    );
     assert_eq!(
-        deleted,
-        json!({"deleted":true, "trashed_to":".trash/song.md"})
+        c.ok("delete_note", json!({"path":"Projects/song.md"}))
+            .await,
+        "deleted; moved to .trash/song.md"
     );
     assert!(root.join(".trash/song.md").is_file());
     for (tool, arguments) in [
@@ -549,11 +618,11 @@ async fn edits_are_exact_and_deleted_notes_leave_search() {
         ("search_notes", json!({"query":"song", "path_only":true})),
         ("list_notes", json!({})),
     ] {
-        assert_eq!(c.data(tool, arguments).await["count"], 0);
+        assert_eq!(c.page(tool, arguments).await.count, 0);
     }
     assert_eq!(
-        c.data("list_notes", json!({"folder":".trash"})).await["notes"],
-        json!([".trash/song.md"])
+        c.ok("list_notes", json!({"folder":".trash"})).await,
+        "[1 note; end]\n.trash/song.md"
     );
     let gone = c
         .failure("delete_note", json!({"path":"Projects/song.md"}))

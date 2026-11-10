@@ -110,7 +110,7 @@ Read the release notes before upgrading clients that process tool output directl
 Starting with v0.3.0:
 
 - `read_note` returns at most 200 lines by default and clamps explicit limits to
-  500 lines. Follow `next_offset` while `has_more` is true to read more.
+  500 lines. Follow the reported offset to read more.
 - `list_tags` returns the first 100 tags by default, with a maximum of 500 per page.
 - Lists, searches, backlinks, and tags provide pagination metadata. Their offsets
   are zero-based; read offsets are 1-based line numbers.
@@ -137,5 +137,20 @@ Starting with v0.4.0:
   its file name.
 - New tools: `delete_note` (moves to `.trash`) and `move_note`. `list_notes`
   accepts `tag`; `update_note` accepts `expected_total_lines`.
+
+Starting with v0.5.0:
+
+- Results are plain text instead of JSON. The first line is a status in brackets,
+  such as `[20 notes; more: offset=20]` or `[3 notes; end]`, and the items follow
+  one per line. Clients that parsed the JSON fields `count`, `has_more`, and
+  `next_offset` must read that line instead.
+- `read_note` returns the note text from the second line exactly as stored, with
+  no JSON escaping. Its status is `[lines 1-200 of 950; more: offset=201]`.
+- `search_notes` and `get_backlinks` write each note's path once, followed by
+  indented `line: text` lines. Backlinks were previously one object per line.
+- `list_notes` with `details: true` writes `modified bytes path` per line, and
+  `list_tags` writes `tag notes` per line.
+- Write tools answer with a short phrase: `created`, `appended`, `patched`,
+  `moved`, `updated; was 320 lines, now 12`, `deleted; moved to .trash/Note.md`.
 
 See the [usage guide](usage.md) for examples and troubleshooting.

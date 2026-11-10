@@ -37,7 +37,7 @@ Call `list_notes` when you want to discover notes without a search term:
 }
 ```
 
-The list includes notes in subfolders. Omit `folder` to browse the whole vault. Compact note paths are returned in `notes` by default. Add `details: true` only when you need modification dates and sizes: the response then carries `details` (`path`, `modified`, `size`) instead of `notes`.
+The list includes notes in subfolders. Omit `folder` to browse the whole vault. The result is one path per line. Add `details: true` only when you need modification dates and sizes: each line is then `modified bytes path`, newest first.
 
 Add `tag` to keep only notes carrying a tag, whether written inline (`#dev`) or in YAML frontmatter. A tag also matches its nested tags, so `dev` finds `#dev/backend`. Filtering by tag reads note bodies.
 
@@ -74,23 +74,14 @@ To find filenames or paths without reading note contents:
 
 Matching lines are grouped under their note, so each path appears once per page:
 
-```json
-{
-  "matches": [
-    {
-      "path": "Projects/SZAPETA/Overview.md",
-      "lines": [
-        { "line": 4, "excerpt": "Pending review" },
-        { "line": 19, "excerpt": "pending: deploy" }
-      ]
-    }
-  ],
-  "count": 2,
-  "has_more": false
-}
+```text
+[2 matching lines; end]
+Projects/SZAPETA/Overview.md
+  4: Pending review
+  19: pending: deploy
 ```
 
-`limit`, `offset`, and `count` are measured in matching lines, not notes. Each line has a 1-based line number and a preview of up to 240 characters plus an ellipsis if shortened. A preview may omit text near the end of a long line; read the original note at the returned line when needed. Path-only matches contain only `path`.
+`limit`, `offset`, and the count in the first line are measured in matching lines, not notes. Each indented line is a 1-based line number and a preview of up to 240 characters plus an ellipsis if shortened. A preview may omit text near the end of a long line; read the original note at the returned line when needed. Path-only matches are the paths alone.
 
 ## Read only what you need
 
@@ -105,7 +96,15 @@ Call `read_note` with a vault-relative `.md` path:
 }
 ```
 
-Without `limit`, the tool returns up to **200 lines**, not necessarily the entire note. The maximum is **500 lines per call**. The response includes `total_lines`, `lines_read`, `has_more`, and `next_offset` when more lines remain.
+Without `limit`, the tool returns up to **200 lines**, not necessarily the entire note. The maximum is **500 lines per call**. The first line of the result is a status, and the note text follows from the second line exactly as stored, with no escaping:
+
+```text
+[lines 1-50 of 320; more: offset=51]
+# Overview
+...
+```
+
+The status gives the lines returned, the total number of lines in the note, and either the offset of the next page or `end`.
 
 Use `get_note_outline` when you need headings and their line numbers before choosing a section to read:
 
@@ -116,7 +115,7 @@ Use `get_note_outline` when you need headings and their line numbers before choo
 }
 ```
 
-An outline returns headings instead of the body. You do not need to request an outline before every small read.
+An outline returns headings instead of the body, one per line as `line: ## Heading`. You do not need to request an outline before every small read.
 
 ## Continue to another page
 
@@ -128,18 +127,14 @@ An outline returns headings instead of the body. You do not need to request an o
 | `list_tags` | 100 | 500 | Zero-based number of tags to skip | Usage descending, then tag |
 | `read_note` | 200 | 500 | **1-based starting line** | Document order |
 
-Lists and searches return `count` for the current page, not the total number of results. For example, a `list_notes` response can look like:
+Every result is plain text whose first line is a status in brackets. It gives the number of results on this page, not the total, and then either `more: offset=N` or `end`. For example, a `list_notes` result can look like:
 
-```json
-{
-  "notes": ["Projects/SZAPETA/Overview.md"],
-  "count": 1,
-  "has_more": true,
-  "next_offset": 1
-}
+```text
+[1 note; more: offset=1]
+Projects/SZAPETA/Overview.md
 ```
 
-To continue, call the same tool with the same filters and pass `next_offset` as `offset`. For this example:
+To continue, call the same tool with the same filters and pass that offset. For this example:
 
 ```json
 {
@@ -150,7 +145,7 @@ To continue, call the same tool with the same filters and pass `next_offset` as 
 }
 ```
 
-Stop when `has_more` is false, or as soon as you have enough information for your task. Do not reuse an offset with different filters. If notes change between calls, page contents can shift; restart the listing if you need to check the current results again.
+Stop when the status ends in `end`, or as soon as you have enough information for your task. Do not reuse an offset with different filters. If notes change between calls, page contents can shift; restart the listing if you need to check the current results again.
 
 Compact listings, searches, and backlinks traverse folders as needed and stop after filling the page plus one continuation result. A partial page does not validate unvisited subfolders or unread note content; later pages can report an I/O or symlink error when that part of the vault is reached. Encountered errors are not silently skipped. Detailed listings must inspect metadata across the selected folder to find the newest notes, and tag counts require a full-vault scan. Results are read from the filesystem on each request, not from a persistent index.
 
@@ -174,9 +169,9 @@ Choose the write tool according to the task:
 - `create_note`: create a new note; fails if the destination already exists. Parent folders are created as needed.
 - `append_note`: add content to the end of an existing note. The content always starts on a new line; you do not need to begin it with a newline.
 - `patch_note`: replace one unique existing text snippet.
-- `update_note`: intentionally replace the entire contents of an existing note. Pass `expected_total_lines` with the `total_lines` from your latest `read_note`; the write is rejected if the note has a different number of lines, which catches replacing a long note after reading only its first page. The response reports `previous_total_lines` and `total_lines`.
+- `update_note`: intentionally replace the entire contents of an existing note. Pass `expected_total_lines` with the note's line count from your latest `read_note` (the number after `of` in its status line); the write is rejected if the note has a different number of lines, which catches replacing a long note after reading only its first page. The result reports the line count before and after, as in `updated; was 320 lines, now 12`.
 - `move_note`: move or rename a note to `new_path`; fails if the destination exists. Links in other notes are not rewritten, so check `get_backlinks` afterwards.
-- `delete_note`: move a note to the vault's `.trash` folder, as Obsidian does, and return its new location in `trashed_to`. Restore it with `move_note` from that path.
+- `delete_note`: move a note to the vault's `.trash` folder, as Obsidian does, and report its new location, as in `deleted; moved to .trash/Overview.md`. Restore it with `move_note` from that path.
 
 On macOS and Windows, `patch_note` and `update_note` keep the note's creation date. Other systems do not allow setting it, so a rewritten note gets a new one there.
 
@@ -194,9 +189,9 @@ Call `get_backlinks` to find lines containing wikilinks to a note:
 }
 ```
 
-Results are matching lines, not necessarily distinct source notes. When you pass a path, only that note is excluded as a source; when you pass a bare title, every note with that title is. Backlink matching is not a complete replacement for Obsidian's link resolver; duplicate note titles and relative links can be ambiguous.
+Results are grouped like search results: each linking note is a path line followed by its indented `line: text` lines. The count is in linking lines, not distinct notes. When you pass a path, only that note is excluded as a source; when you pass a bare title, every note with that title is. Backlink matching is not a complete replacement for Obsidian's link resolver; duplicate note titles and relative links can be ambiguous.
 
-Call `list_tags` to list tags and their note counts:
+Call `list_tags` to list tags and their note counts, one `tag notes` pair per line:
 
 ```json
 {
@@ -209,7 +204,7 @@ Tag listing scans the vault. Reuse the returned information when it is still suf
 
 ## Troubleshooting
 
-Every tool answers with one block of JSON text. A failed call is returned as a tool result marked `isError`, with a message that says how to correct the call.
+Every tool answers with one block of plain text. A failed call is returned as a tool result marked `isError`, with a message that says how to correct the call.
 
 | Message or symptom | What to do |
 | --- | --- |
@@ -225,7 +220,7 @@ Every tool answers with one block of JSON text. A failed call is returned as a t
 | Note path rejected | Include the `.md` extension. |
 | Patch text is missing or ambiguous | Read the relevant lines again and supply an exact, unique snippet. |
 | A read or search reports an I/O error | Check that the affected note exists, is readable, and contains valid UTF-8 text. |
-| A note or list appears incomplete | Inspect `has_more` and request `next_offset` if you need more. |
+| A note or list appears incomplete | Read the status in the first line and request the offset after `more: offset=` if you need more. |
 | The client still shows old tool descriptions or behavior after upgrading | Restart or reconnect the MCP server to refresh cached instructions and tool schemas. Verify the client is launching the intended `obm` executable. |
 
 For configuration problems, run `obm doctor`.

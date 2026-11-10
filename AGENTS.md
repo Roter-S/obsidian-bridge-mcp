@@ -26,6 +26,7 @@
 - Run a filtered test: `cargo test vault::tests::search_notes_returns_matches`.
 - Run the public MCP wire-contract tests: `cargo test --test mcp_contract`.
 - Run opt-in synthetic performance measurements: `cargo test --locked --release vault::benchmarks::synthetic_vault -- --ignored --nocapture`. The benchmark uses temporary vaults with 2,000 and 20,000 notes, warmed filesystem caches, and nine samples per operation; it is not a cold-disk or end-to-end MCP benchmark. Compare the same workload and environment before claiming improvements.
+- Compare tool results with shell commands on the same synthetic vault: `cargo test --locked --release tools::benchmarks::shell_comparison -- --ignored --nocapture`. It runs the system `find`, `grep`, `cat`, `sed`, `sort`, `uniq`, and ripgrep when installed, only as measured subjects; nothing depends on them. Report sizes as bytes and label token counts as estimates.
 
 ## Configuration and Transport
 
@@ -40,15 +41,15 @@
 
 - `vault` is optional only when exactly one vault is configured. With multiple vaults, require an exact name; never choose a vault arbitrarily, especially for writes.
 - Note paths are vault-relative and must end in `.md`. Reject absolute paths, `..`, `.obsidian`, and symlinks. Omit optional `folder` to select the vault root.
-- Every tool result is exactly one JSON text block: no `structuredContent` copy and no output schema. Vault and note failures are tool results with `isError: true` and a message that says how to correct the call, never JSON-RPC errors. Parameter structs reject unknown fields.
+- Every tool result is exactly one plain-text block: no JSON, no `structuredContent` copy, and no output schema. Its first line is a bracketed status (`[N things; more: offset=K]` or `[N things; end]`; `read_note` uses `[lines A-B of TOTAL; ...]`) so the paging state survives a client that truncates long output; items follow one per line. Note text is returned unescaped, exactly as stored. Vault and note failures are tool results with `isError: true` and a message that says how to correct the call, never JSON-RPC errors. Parameter structs reject unknown fields.
 - Traversal skips folders whose names start with a dot (`.obsidian`, `.trash`, `.git`) below the selected folder; a dot-folder named explicitly as `folder` is traversed.
 - Use `list_notes` for browsing without a query. `search_notes` requires non-empty literal text after trimming; reject it with an actionable query error, not `EmptyPath`.
-- `path_only` search must not read note bodies; its matches contain only `path`. Content matches are grouped per note (`matches[].lines[]`) while `limit`, `offset`, and `count` count matching lines. Search ignores case and accents (NFD, combining marks dropped); keep the allocation-free ASCII path.
-- `list_notes` returns `notes` (compact) or `details` (`path`, `modified` in UTC seconds, `size`), never both. Detailed ordering uses the full-precision modification time. `tag` matches inline and frontmatter tags, including nested tags.
+- `path_only` search must not read note bodies; its matches are paths alone. Content matches and backlinks write each note's path once, followed by indented `line: text` lines, while `limit`, `offset`, and the status count are in matching lines. Search ignores case and accents (NFD, combining marks dropped); keep the allocation-free ASCII path.
+- `list_notes` writes one path per line, or with `details` one `modified bytes path` line (UTC seconds) per note. Detailed ordering uses the full-precision modification time. `tag` matches inline and frontmatter tags, including nested tags.
 - Default / maximum limits: `list_notes` 100/500; `search_notes` 20/200; `get_backlinks` 50/200; `list_tags` 100/500; `read_note` 200/500 lines. MCP limits clamp to at least 1.
-- Lists, searches, backlinks, and tags use zero-based result offsets. `read_note` uses 1-based line offsets. Return `has_more` and `next_offset` when more results remain; `count` means the current page size, not a total.
+- Lists, searches, backlinks, and tags use zero-based result offsets. `read_note` uses 1-based line offsets. Report `more: offset=N` in the status line when more results remain; the status count is the current page size, not a total.
 - Search/backlinks are ordered by path then line; compact lists by path; detailed lists by modification time descending then path; tags by usage descending then tag. Preserve stable ordering for unchanged vault contents.
-- Search/backlink excerpts are capped at 240 Unicode characters plus an ellipsis when shortened. Omit unused optional response fields instead of emitting redundant nulls.
+- Search/backlink excerpts are capped at 240 Unicode characters plus an ellipsis when shortened. Do not repeat request arguments such as the path in a result.
 - Preserve standard read-only/destructive/closed-world tool annotations. They inform clients but do not replace client approval policies.
 - Missing notes, folders, and vaults are `isError` results that name the missing resource and how to find it. Do not silently discard read failures and return an apparently complete successful result.
 

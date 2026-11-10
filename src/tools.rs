@@ -7,10 +7,10 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::error::ObsidianError;
-use crate::vault::{BacklinkMatch, HeadingItem, NoteInfo, TagInfo, VaultInfo, VaultRegistry};
+use crate::vault::VaultRegistry;
 
 #[derive(Debug, Clone)]
 pub struct ObsidianService {
@@ -43,10 +43,12 @@ pub struct ListNotesParams {
     #[schemars(with = "Option<u32>")]
     pub limit: Option<usize>,
     #[schemars(
-        description = "Return modified date and size per note instead of bare paths. Defaults to false for minimal token usage."
+        description = "Return `modified bytes path` per note instead of bare paths. Defaults to false for minimal token usage."
     )]
     pub details: Option<bool>,
-    #[schemars(description = "Zero-based result offset; use next_offset from previous response")]
+    #[schemars(
+        description = "Zero-based result offset; use the offset from the previous result's first line"
+    )]
     #[schemars(with = "Option<u32>")]
     pub offset: Option<usize>,
 }
@@ -62,7 +64,7 @@ pub struct ReadNoteParams {
     #[schemars(with = "Option<u32>")]
     pub offset: Option<usize>,
     #[schemars(
-        description = "Maximum lines to read (default 200, max 500). Follow next_offset for more."
+        description = "Maximum lines to read (default 200, max 500). The first line gives the next offset."
     )]
     #[schemars(with = "Option<u32>")]
     pub limit: Option<usize>,
@@ -96,7 +98,9 @@ pub struct SearchNotesParams {
         description = "If true, only searches note titles/paths (much faster, zero body I/O)"
     )]
     pub path_only: Option<bool>,
-    #[schemars(description = "Zero-based match offset; use next_offset from previous response")]
+    #[schemars(
+        description = "Zero-based match offset; use the offset from the previous result's first line"
+    )]
     #[schemars(with = "Option<u32>")]
     pub offset: Option<usize>,
 }
@@ -122,7 +126,7 @@ pub struct UpdateNoteParams {
     #[schemars(description = "The complete new note. Everything not included is lost.")]
     pub content: String,
     #[schemars(
-        description = "total_lines from your latest read_note of this note. The write is rejected if the note has a different line count, which protects against replacing a note you only partly read."
+        description = "The note's line count from your latest read_note (the number after `of` in its first line). The write is rejected if the note has a different line count, which protects against replacing a note you only partly read."
     )]
     #[schemars(with = "Option<u32>")]
     pub expected_total_lines: Option<usize>,
@@ -164,7 +168,9 @@ pub struct GetBacklinksParams {
     #[schemars(description = "Maximum number of backlinks to return (default 50, max 200)")]
     #[schemars(with = "Option<u32>")]
     pub limit: Option<usize>,
-    #[schemars(description = "Zero-based match offset; follow next_offset")]
+    #[schemars(
+        description = "Zero-based match offset; use the offset from the previous result's first line"
+    )]
     #[schemars(with = "Option<u32>")]
     pub offset: Option<usize>,
 }
@@ -177,127 +183,42 @@ pub struct ListTagsParams {
     #[schemars(description = "Maximum tags to return (default 100, max 500)")]
     #[schemars(with = "Option<u32>")]
     pub limit: Option<usize>,
-    #[schemars(description = "Zero-based result offset; follow next_offset")]
+    #[schemars(
+        description = "Zero-based result offset; use the offset from the previous result's first line"
+    )]
     #[schemars(with = "Option<u32>")]
     pub offset: Option<usize>,
 }
 
-#[derive(Serialize)]
-struct ListVaultsResult {
-    vaults: Vec<VaultInfo>,
-}
-
-// Exactly one of `notes` (compact) or `details` is present.
-#[derive(Serialize)]
-struct ListNotesResult {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    notes: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<Vec<NoteInfo>>,
-    #[serde(flatten)]
-    page: Page,
-}
-
-#[derive(Serialize)]
-struct Page {
-    count: usize,
-    has_more: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_offset: Option<usize>,
-}
-
-impl Page {
-    fn new(offset: usize, count: usize, has_more: bool) -> Self {
-        Self {
-            count,
-            has_more,
-            next_offset: has_more.then(|| offset.saturating_add(count)),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ReadNoteResult {
-    content: String,
-    total_lines: usize,
-    lines_read: usize,
-    has_more: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_offset: Option<usize>,
-}
-
-#[derive(Serialize)]
-struct GetNoteOutlineResult {
-    headings: Vec<HeadingItem>,
-    total_lines: usize,
-}
-
-// Matching lines are grouped under their note so its path is sent once.
-#[derive(Serialize)]
-struct SearchNote {
-    path: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    lines: Vec<SearchLine>,
-}
-
-#[derive(Serialize)]
-struct SearchLine {
-    line: usize,
-    excerpt: String,
-}
-
-#[derive(Serialize)]
-struct SearchNotesResult {
-    matches: Vec<SearchNote>,
-    #[serde(flatten)]
-    page: Page,
-}
-
-#[derive(Serialize)]
-struct UpdateNoteResult {
-    updated: bool,
-    previous_total_lines: usize,
-    total_lines: usize,
-}
-
-#[derive(Serialize)]
-struct GetBacklinksResult {
-    backlinks: Vec<BacklinkMatch>,
-    #[serde(flatten)]
-    page: Page,
-}
-
-#[derive(Serialize)]
-struct ListTagsResult {
-    tags: Vec<TagInfo>,
-    #[serde(flatten)]
-    page: Page,
-}
-
 type ToolResult = Result<CallToolResult, ErrorData>;
 
-// One compact JSON text block per result: every MCP client can show it, and
-// the payload is not repeated as structured content. Failures are tool-level
-// results (`isError`), which clients pass to the model; a JSON-RPC protocol
-// error is often shown opaquely and cannot be corrected by the caller.
-fn reply<T: Serialize>(result: Result<T, ObsidianError>) -> ToolResult {
-    let value = match result {
-        Ok(value) => value,
-        Err(error) => {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                error.to_string(),
-            )]));
-        }
-    };
-    let text = serde_json::to_string(&value)
-        .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+// Results are plain text, the form that costs a model the fewest tokens and
+// that every MCP client can show. The first line is a bracketed status, so it
+// survives a client that truncates long output. Failures are tool-level results
+// (`isError`), which clients pass to the model; a JSON-RPC protocol error is
+// often shown opaquely and cannot be corrected by the caller.
+fn reply(result: Result<String, ObsidianError>) -> ToolResult {
+    Ok(match result {
+        Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+        Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
+    })
+}
+
+// `[20 notes; more: offset=20]` or `[3 notes; end]`.
+fn status(count: usize, unit: &str, offset: usize, has_more: bool) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    if has_more {
+        let next = offset.saturating_add(count);
+        format!("[{count} {unit}{plural}; more: offset={next}]")
+    } else {
+        format!("[{count} {unit}{plural}; end]")
+    }
 }
 
 #[tool_router]
 impl ObsidianService {
     #[tool(
-        description = "List configured Obsidian vaults",
+        description = "List configured Obsidian vaults, one name per line",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -305,13 +226,17 @@ impl ObsidianService {
         )
     )]
     async fn list_vaults(&self) -> ToolResult {
-        reply(Ok(ListVaultsResult {
-            vaults: self.registry.list(),
-        }))
+        let vaults = self.registry.list();
+        let mut text = status(vaults.len(), "vault", 0, false);
+        for vault in vaults {
+            text.push('\n');
+            text.push_str(&vault.name);
+        }
+        reply(Ok(text))
     }
 
     #[tool(
-        description = "Browse markdown paths recursively, no query needed. Use for folder discovery, not search_notes with an empty query. Returns notes (paths) by default; stops after the requested page. details=true returns details (path, modified, size) instead, scanning all note metadata, newest first. tag keeps only notes with that tag. Hidden folders such as .trash are skipped unless named as folder. Follow next_offset while has_more.",
+        description = "Browse markdown paths recursively, no query needed. Use for folder discovery, not search_notes with an empty query. Returns one path per line; stops after the requested page. details=true returns `modified bytes path` per line instead, scanning all note metadata, newest first. tag keeps only notes with that tag. Hidden folders such as .trash are skipped unless named as folder. The first line says `more: offset=N` when more remain.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -326,32 +251,32 @@ impl ObsidianService {
                 let offset = params.offset.unwrap_or(0);
                 let fetch = offset.saturating_add(limit).saturating_add(1);
                 let (folder, tag) = (params.folder.as_deref(), params.tag.as_deref());
-                let (notes, details, count, has_more) = if params.details.unwrap_or(false) {
+                let (lines, has_more) = if params.details.unwrap_or(false) {
                     let (page, has_more) =
                         take_page(vault.list_notes(folder, fetch, tag).await?, offset, limit);
-                    let count = page.len();
-                    (None, Some(page), count, has_more)
+                    let lines = page
+                        .into_iter()
+                        .map(|note| format!("{} {} {}", note.modified, note.size, note.path))
+                        .collect();
+                    (lines, has_more)
                 } else {
-                    let (page, has_more) = take_page(
+                    take_page(
                         vault.list_note_paths(folder, fetch, tag).await?,
                         offset,
                         limit,
-                    );
-                    let count = page.len();
-                    (Some(page), None, count, has_more)
+                    )
                 };
-                Ok(ListNotesResult {
-                    notes,
-                    details,
-                    page: Page::new(offset, count, has_more),
-                })
+                Ok(with_lines(
+                    status(lines.len(), "note", offset, has_more),
+                    &lines,
+                ))
             }
             .await,
         )
     }
 
     #[tool(
-        description = "Read a note, default 200 lines, max 500 per call. Offset is 1-based. Follow next_offset while has_more. Use get_note_outline first only when structure is needed.",
+        description = "Read a note, default 200 lines, max 500 per call. Offset is 1-based. The first line is a status such as `[lines 1-200 of 950; more: offset=201]`; the note text starts on the second line, exactly as stored. Use get_note_outline first only when structure is needed.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -364,25 +289,31 @@ impl ObsidianService {
                 let vault = self.registry.get_or_default(params.vault.as_deref())?;
                 let offset = params.offset.unwrap_or(1).max(1);
                 let limit = clamp_limit(params.limit, 200, 500);
-                let (content, total_lines, lines_read) = vault
+                let (content, total, read) = vault
                     .read_note_range(&params.path, Some(offset), Some(limit))
                     .await?;
-                let next = offset.saturating_add(lines_read);
-                let has_more = next <= total_lines;
-                Ok(ReadNoteResult {
-                    content,
-                    total_lines,
-                    lines_read,
-                    has_more,
-                    next_offset: has_more.then_some(next),
-                })
+                if read == 0 {
+                    return Ok(format!(
+                        "[no lines at offset {offset}; note has {total} lines; end]"
+                    ));
+                }
+                let next = offset.saturating_add(read);
+                let tail = if next <= total {
+                    format!("more: offset={next}")
+                } else {
+                    "end".to_owned()
+                };
+                Ok(format!(
+                    "[lines {offset}-{} of {total}; {tail}]\n{content}",
+                    next - 1
+                ))
             }
             .await,
         )
     }
 
     #[tool(
-        description = "Return headings with line numbers instead of the note body. Scans the file internally. Use when structure is needed before choosing lines to read.",
+        description = "Return headings as `line: ## Heading` instead of the note body. Scans the file internally. Use when structure is needed before choosing lines to read.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -394,17 +325,23 @@ impl ObsidianService {
             async {
                 let vault = self.registry.get_or_default(params.vault.as_deref())?;
                 let (headings, total_lines) = vault.get_note_outline(&params.path).await?;
-                Ok(GetNoteOutlineResult {
-                    headings,
-                    total_lines,
-                })
+                let plural = if headings.len() == 1 { "" } else { "s" };
+                let mut text = format!(
+                    "[{} heading{plural}; note has {total_lines} lines]",
+                    headings.len()
+                );
+                for heading in headings {
+                    let marks = "#".repeat(heading.level.into());
+                    text.push_str(&format!("\n{}: {marks} {}", heading.line, heading.text));
+                }
+                Ok(text)
             }
             .await,
         )
     }
 
     #[tool(
-        description = "Find non-empty literal text in note content or paths (path_only=true, no body reads), ignoring case and accents. To list a folder use list_notes. Matching lines are grouped per note, ordered by path/line; limit, offset and count are in matching lines; snippets capped at 240 characters. Hidden folders such as .trash are skipped. Follow next_offset while has_more.",
+        description = "Find non-empty literal text in note content or paths (path_only=true, no body reads), ignoring case and accents. To list a folder use list_notes. Each matching note is a path line followed by indented `line: text` lines, ordered by path/line; limit, offset and the count are in matching lines; snippets capped at 240 characters. Hidden folders such as .trash are skipped. The first line says `more: offset=N` when more remain.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -429,26 +366,11 @@ impl ObsidianService {
                     .await?;
                 let has_more = found.len() > limit;
                 found.truncate(limit);
-                let count = found.len();
-                let mut matches: Vec<SearchNote> = Vec::new();
-                for item in found {
-                    if matches.last().is_none_or(|note| note.path != item.path) {
-                        matches.push(SearchNote {
-                            path: item.path,
-                            lines: Vec::new(),
-                        });
-                    }
-                    if !path_only && let Some(note) = matches.last_mut() {
-                        note.lines.push(SearchLine {
-                            line: item.line,
-                            excerpt: item.excerpt,
-                        });
-                    }
-                }
-                Ok(SearchNotesResult {
-                    matches,
-                    page: Page::new(offset, count, has_more),
-                })
+                let unit = if path_only { "path" } else { "matching line" };
+                let lines = found
+                    .into_iter()
+                    .map(|item| (item.path, (!path_only).then_some((item.line, item.excerpt))));
+                Ok(grouped(status(lines.len(), unit, offset, has_more), lines))
             }
             .await,
         )
@@ -467,7 +389,7 @@ impl ObsidianService {
             async {
                 let vault = self.registry.get_or_default(params.vault.as_deref())?;
                 vault.create_note(&params.path, &params.content).await?;
-                Ok(serde_json::json!({ "created": true }))
+                Ok("created".to_owned())
             }
             .await,
         )
@@ -486,7 +408,7 @@ impl ObsidianService {
             async {
                 let vault = self.registry.get_or_default(params.vault.as_deref())?;
                 vault.append_note(&params.path, &params.content).await?;
-                Ok(serde_json::json!({ "updated": true }))
+                Ok("appended".to_owned())
             }
             .await,
         )
@@ -504,14 +426,10 @@ impl ObsidianService {
         reply(
             async {
                 let vault = self.registry.get_or_default(params.vault.as_deref())?;
-                let (previous_total_lines, total_lines) = vault
+                let (previous, current) = vault
                     .update_note(&params.path, &params.content, params.expected_total_lines)
                     .await?;
-                Ok(UpdateNoteResult {
-                    updated: true,
-                    previous_total_lines,
-                    total_lines,
-                })
+                Ok(format!("updated; was {previous} lines, now {current}"))
             }
             .await,
         )
@@ -532,14 +450,14 @@ impl ObsidianService {
                 vault
                     .patch_note(&params.path, &params.old_text, &params.new_text)
                     .await?;
-                Ok(serde_json::json!({ "patched": true }))
+                Ok("patched".to_owned())
             }
             .await,
         )
     }
 
     #[tool(
-        description = "Delete a note by moving it to the vault's .trash folder, as Obsidian does. Returns trashed_to; restore with move_note from that path. Links to the note are not changed.",
+        description = "Delete a note by moving it to the vault's .trash folder, as Obsidian does. The result names its new path; restore with move_note from that path. Links to the note are not changed.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -551,7 +469,7 @@ impl ObsidianService {
             async {
                 let vault = self.registry.get_or_default(params.vault.as_deref())?;
                 let trashed_to = vault.delete_note(&params.path).await?;
-                Ok(serde_json::json!({ "deleted": true, "trashed_to": trashed_to }))
+                Ok(format!("deleted; moved to {trashed_to}"))
             }
             .await,
         )
@@ -570,14 +488,14 @@ impl ObsidianService {
             async {
                 let vault = self.registry.get_or_default(params.vault.as_deref())?;
                 vault.move_note(&params.path, &params.new_path).await?;
-                Ok(serde_json::json!({ "moved": true }))
+                Ok("moved".to_owned())
             }
             .await,
         )
     }
 
     #[tool(
-        description = "Find wikilinks [[...]] pointing to a note. Ordered by path/line; snippets capped at 240 characters. Follow next_offset while has_more. Basename links may be ambiguous when titles repeat.",
+        description = "Find wikilinks [[...]] pointing to a note. Each linking note is a path line followed by indented `line: text` lines, ordered by path/line; the count is in linking lines; snippets capped at 240 characters. The first line says `more: offset=N` when more remain. Basename links may be ambiguous when titles repeat.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -596,18 +514,20 @@ impl ObsidianService {
                 let mut backlinks = vault.get_backlinks(&params.path, limit + 1, offset).await?;
                 let has_more = backlinks.len() > limit;
                 backlinks.truncate(limit);
-                let count = backlinks.len();
-                Ok(GetBacklinksResult {
-                    backlinks,
-                    page: Page::new(offset, count, has_more),
-                })
+                let lines = backlinks
+                    .into_iter()
+                    .map(|link| (link.source_path, Some((link.line, link.excerpt))));
+                Ok(grouped(
+                    status(lines.len(), "linking line", offset, has_more),
+                    lines,
+                ))
             }
             .await,
         )
     }
 
     #[tool(
-        description = "List tags (#tag and YAML frontmatter), sorted by usage then name. Scans the vault; reuse results. Default 100, max 500; follow next_offset while has_more. To find the notes with a tag, use list_notes with tag.",
+        description = "List tags (#tag and YAML frontmatter) as `tag notes` per line, sorted by usage then name. Scans the vault; reuse results. Default 100, max 500; the first line says `more: offset=N` when more remain. To find the notes with a tag, use list_notes with tag.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -622,12 +542,16 @@ impl ObsidianService {
                 let offset = params.offset.unwrap_or(0);
                 let limit = clamp_limit(params.limit, 100, 500);
                 let has_more = tags.len().saturating_sub(offset) > limit;
-                let tags: Vec<_> = tags.into_iter().skip(offset).take(limit).collect();
-                let count = tags.len();
-                Ok(ListTagsResult {
-                    tags,
-                    page: Page::new(offset, count, has_more),
-                })
+                let lines: Vec<_> = tags
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|tag| format!("{} {}", tag.tag, tag.count))
+                    .collect();
+                Ok(with_lines(
+                    status(lines.len(), "tag", offset, has_more),
+                    &lines,
+                ))
             }
             .await,
         )
@@ -644,7 +568,7 @@ impl ServerHandler for ObsidianService {
         )
         .with_server_info(rmcp::model::Implementation::new("obsidian", env!("CARGO_PKG_VERSION")))
         .with_instructions(format!(
-            "Obsidian notes. Configured vaults: {vaults}. Pass exact vault name when multiple; optional with one. Never guess a vault for writes. Browse folders with list_notes (no query); search_notes requires non-empty literal text, path_only avoids body reads. Paths/folders are vault-relative; notes end in .md. Read only needed pages (read_note defaults to 200 lines); follow next_offset while has_more. List/search offsets are zero-based; read offsets are 1-based. Use patch_note for small unique edits and append_note to add at the end; update_note replaces the whole note. delete_note moves a note to .trash; move_note renames. Results are JSON text; failed calls return isError with a message saying how to fix the call. No skill required."
+            "Obsidian notes. Configured vaults: {vaults}. Pass exact vault name when multiple; optional with one. Never guess a vault for writes. Browse folders with list_notes (no query); search_notes requires non-empty literal text, path_only avoids body reads. Paths/folders are vault-relative; notes end in .md. Results are plain text whose first line is a bracketed status: `more: offset=N` means more remain (call again with offset N), `end` means that was all. Read only needed pages (read_note defaults to 200 lines). List/search offsets are zero-based; read offsets are 1-based. Use patch_note for small unique edits and append_note to add at the end; update_note replaces the whole note. delete_note moves a note to .trash; move_note renames. Failed calls return isError with a message saying how to fix the call. No skill required."
         ))
     }
 }
@@ -660,6 +584,37 @@ fn take_page<T>(items: Vec<T>, offset: usize, limit: usize) -> (Vec<T>, bool) {
     page.truncate(limit);
     (page, has_more)
 }
+
+fn with_lines(mut text: String, lines: &[String]) -> String {
+    for line in lines {
+        text.push('\n');
+        text.push_str(line);
+    }
+    text
+}
+
+// A note's path is written once, followed by its indented `line: text` lines.
+fn grouped(
+    mut text: String,
+    items: impl Iterator<Item = (String, Option<(usize, String)>)>,
+) -> String {
+    let mut current: Option<String> = None;
+    for (path, line) in items {
+        if current.as_deref() != Some(path.as_str()) {
+            text.push('\n');
+            text.push_str(&path);
+            current = Some(path);
+        }
+        if let Some((number, excerpt)) = line {
+            text.push_str(&format!("\n  {number}: {excerpt}"));
+        }
+    }
+    text
+}
+
+#[cfg(test)]
+#[path = "tools_bench.rs"]
+mod benchmarks;
 
 #[cfg(test)]
 mod tests {
@@ -691,10 +646,10 @@ mod tests {
         )
     }
 
-    fn data(result: ToolResult) -> serde_json::Value {
+    fn ok(result: ToolResult) -> String {
         let (is_error, text) = text(result);
         assert!(!is_error, "{text}");
-        serde_json::from_str(&text).expect("JSON result")
+        text
     }
 
     fn write(path: &str, content: &str) -> Parameters<WriteNoteParams> {
@@ -721,65 +676,85 @@ mod tests {
         })
     }
 
+    fn list(details: bool, limit: Option<usize>) -> Parameters<ListNotesParams> {
+        Parameters(ListNotesParams {
+            vault: None,
+            folder: None,
+            tag: None,
+            limit,
+            details: Some(details),
+            offset: None,
+        })
+    }
+
     #[tokio::test]
     async fn test_list_and_read_notes_default_vault() {
         let (_temp, service) = test_service();
-        data(
-            service
+        assert_eq!(
+            ok(service
                 .create_note(write("test.md", "# Hello\nLine 2\nLine 3"))
-                .await,
+                .await),
+            "created"
         );
-
-        let list = data(
-            service
-                .list_notes(Parameters(ListNotesParams {
-                    vault: None,
-                    folder: None,
-                    tag: None,
-                    limit: None,
-                    details: None,
-                    offset: None,
-                }))
-                .await,
+        assert_eq!(ok(service.list_vaults().await), "[1 vault; end]\nTestVault");
+        assert_eq!(
+            ok(service.list_notes(list(false, None)).await),
+            "[1 note; end]\ntest.md"
         );
-        assert_eq!(list["notes"], serde_json::json!(["test.md"]));
-        assert!(list.get("details").is_none());
+        let detailed = ok(service.list_notes(list(true, None)).await);
+        let (status, line) = detailed.split_once('\n').unwrap();
+        assert_eq!(status, "[1 note; end]");
+        let fields: Vec<_> = line.split(' ').collect();
+        assert!(fields[0].ends_with('Z'), "{line}");
+        assert_eq!(fields[1..], ["21", "test.md"]);
 
-        let read = data(service.read_note(read("test.md", Some(2), Some(1))).await);
-        assert_eq!(read["content"], "Line 2");
-        assert_eq!(read["total_lines"], 3);
-        assert_eq!(read["lines_read"], 1);
+        assert_eq!(
+            ok(service.read_note(read("test.md", Some(2), Some(1))).await),
+            "[lines 2-2 of 3; more: offset=3]\nLine 2"
+        );
+        // The note text follows the status line exactly as stored, unescaped.
+        assert_eq!(
+            ok(service.read_note(read("test.md", None, None)).await),
+            "[lines 1-3 of 3; end]\n# Hello\nLine 2\nLine 3"
+        );
+        assert_eq!(
+            ok(service.read_note(read("test.md", Some(9), None)).await),
+            "[no lines at offset 9; note has 3 lines; end]"
+        );
     }
 
     #[tokio::test]
     async fn test_patch_and_outline() {
         let (_temp, service) = test_service();
-        data(
-            service
-                .create_note(write(
-                    "doc.md",
-                    "# Header\nTarget text\n## Subheader\nOther",
-                ))
-                .await,
+        ok(service
+            .create_note(write(
+                "doc.md",
+                "# Header\nTarget \"text\"\n## Subheader\nOther",
+            ))
+            .await);
+        assert_eq!(
+            ok(service.get_note_outline(note("doc.md")).await),
+            "[2 headings; note has 4 lines]\n1: # Header\n3: ## Subheader"
         );
 
-        let outline = data(service.get_note_outline(note("doc.md")).await);
-        assert_eq!(outline["headings"].as_array().unwrap().len(), 2);
-
-        let patch = data(
-            service
-                .patch_note(Parameters(PatchNoteParams {
-                    vault: None,
-                    path: "doc.md".into(),
-                    old_text: "Target text".into(),
-                    new_text: "Patched text".into(),
-                }))
-                .await,
+        // Text copied from read_note patches without any unescaping.
+        let read_back = ok(service.read_note(read("doc.md", Some(2), Some(1))).await);
+        let old_text = read_back.split_once('\n').unwrap().1;
+        assert_eq!(old_text, "Target \"text\"");
+        let patch = service
+            .patch_note(Parameters(PatchNoteParams {
+                vault: None,
+                path: "doc.md".into(),
+                old_text: old_text.into(),
+                new_text: "Patched text".into(),
+            }))
+            .await;
+        assert_eq!(ok(patch), "patched");
+        assert!(ok(service.read_note(read("doc.md", None, None)).await).contains("Patched text"));
+        assert_eq!(
+            ok(service.append_note(write("doc.md", "more")).await),
+            "appended"
         );
-        assert_eq!(patch["patched"], true);
-
-        let read = data(service.read_note(read("doc.md", None, None)).await);
-        assert!(read["content"].as_str().unwrap().contains("Patched text"));
     }
 
     #[tokio::test]
@@ -800,11 +775,12 @@ mod tests {
     async fn search_groups_lines_under_each_note_and_counts_lines() {
         let (_temp, service) = test_service();
         for name in ["a", "b"] {
-            data(
-                service
-                    .create_note(write(&format!("{name}.md"), "needle 1\nother\nneedle 3"))
-                    .await,
-            );
+            ok(service
+                .create_note(write(
+                    &format!("{name}.md"),
+                    "needle 1\nother [[Target]]\nneedle 3",
+                ))
+                .await);
         }
         let search = |limit, path_only| {
             service.search_notes(Parameters(SearchNotesParams {
@@ -816,33 +792,39 @@ mod tests {
                 offset: None,
             }))
         };
-        let page = data(search(3, false).await);
         assert_eq!(
-            page,
-            serde_json::json!({
-                "matches": [
-                    {"path": "a.md", "lines": [
-                        {"line": 1, "excerpt": "needle 1"},
-                        {"line": 3, "excerpt": "needle 3"},
-                    ]},
-                    {"path": "b.md", "lines": [{"line": 1, "excerpt": "needle 1"}]},
-                ],
-                "count": 3, "has_more": true, "next_offset": 3,
-            })
+            ok(search(3, false).await),
+            "[3 matching lines; more: offset=3]\na.md\n  1: needle 1\n  3: needle 3\nb.md\n  1: needle 1"
         );
+        assert_eq!(ok(search(5, true).await), "[2 paths; end]\na.md\nb.md");
+        assert_eq!(ok(search(1, true).await), "[1 path; more: offset=1]\na.md");
+
+        let backlinks = service
+            .get_backlinks(Parameters(GetBacklinksParams {
+                vault: None,
+                path: "Target".into(),
+                limit: None,
+                offset: None,
+            }))
+            .await;
         assert_eq!(
-            data(search(5, true).await),
-            serde_json::json!({
-                "matches": [{"path": "a.md"}, {"path": "b.md"}],
-                "count": 2, "has_more": false,
-            })
+            ok(backlinks),
+            "[2 linking lines; end]\na.md\n  2: other [[Target]]\nb.md\n  2: other [[Target]]"
         );
+        let tags = service
+            .list_tags(Parameters(ListTagsParams {
+                vault: None,
+                limit: None,
+                offset: None,
+            }))
+            .await;
+        assert_eq!(ok(tags), "[0 tags; end]");
     }
 
     #[tokio::test]
     async fn update_reports_line_counts_and_delete_moves_to_trash() {
         let (temp, service) = test_service();
-        data(service.create_note(write("a.md", "1\n2\n3")).await);
+        ok(service.create_note(write("a.md", "1\n2\n3 #done")).await);
         let update = |content: &str, expected| {
             service.update_note(Parameters(UpdateNoteParams {
                 vault: None,
@@ -855,15 +837,25 @@ mod tests {
         assert!(is_error && message.contains("has 3 lines"), "{message}");
         assert_eq!(
             fs::read_to_string(temp.path().join("a.md")).unwrap(),
-            "1\n2\n3"
+            "1\n2\n3 #done"
         );
         assert_eq!(
-            data(update("only", Some(3)).await),
-            serde_json::json!({"updated": true, "previous_total_lines": 3, "total_lines": 1})
+            ok(update("only #done", Some(3)).await),
+            "updated; was 3 lines, now 1"
         );
+        let tags = service
+            .list_tags(Parameters(ListTagsParams {
+                vault: None,
+                limit: None,
+                offset: None,
+            }))
+            .await;
+        assert_eq!(ok(tags), "[1 tag; end]\ndone 1");
 
-        let deleted = data(service.delete_note(note("a.md")).await);
-        assert_eq!(deleted["trashed_to"], ".trash/a.md");
+        assert_eq!(
+            ok(service.delete_note(note("a.md")).await),
+            "deleted; moved to .trash/a.md"
+        );
         assert!(!temp.path().join("a.md").exists());
         let moved = service
             .move_note(Parameters(MoveNoteParams {
@@ -872,10 +864,10 @@ mod tests {
                 new_path: "restored/a.md".into(),
             }))
             .await;
-        assert_eq!(data(moved)["moved"], true);
+        assert_eq!(ok(moved), "moved");
         assert_eq!(
             fs::read_to_string(temp.path().join("restored/a.md")).unwrap(),
-            "only"
+            "only #done"
         );
     }
 }

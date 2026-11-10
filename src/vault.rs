@@ -18,7 +18,7 @@ use crate::error::ObsidianError;
 
 #[cfg(test)]
 #[path = "vault_bench.rs"]
-mod benchmarks;
+pub(crate) mod benchmarks;
 
 #[derive(Debug, Clone)]
 pub struct VaultRegistry {
